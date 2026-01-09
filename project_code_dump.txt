@@ -1,0 +1,1480 @@
+--- SNAPSHOT DEL PROYECTO (CENSURADO) ---
+
+============================================================
+RUTA: .\.env
+============================================================
+# [CONTENIDO CENSURADO POR SEGURIDAD]
+# --- API KEYS ---
+OPENAI_API_KEY=******
+NOTION_KEY=******
+SUPABASE_URL=******
+SUPABASE_KEY=******
+
+# --- IDS DE BASES DE DATOS DE NOTION ---
+# Nzyme Talent Network
+NOTION_MAIN_DB_ID=******
+# La Base de Datos del Dashboard de Procesos
+NOTION_PROCESS_DASHBOARD_DB_ID=******
+# Guidelines > Reference Materials > Role Templates & Documentation
+NOTION_GUIDELINES_DB_ID=******
+
+============================================================
+RUTA: .\requirements.txt
+============================================================
+
+
+============================================================
+RUTA: .\core\ai_parser.py
+============================================================
+import os
+import pdfplumber
+from typing import List, Optional
+from pydantic import BaseModel, Field
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- MODELOS DE DATOS ---
+
+class SectorExperience(BaseModel):
+    has_experience: bool = Field(description="True if the candidate worked in this sector.")
+    years: float = Field(description="Total years worked in this sector.")
+    companies: List[str] = Field(description="List of company names ONLY. Clean names (e.g. 'Deloitte', not 'Deloitte T&T'). Fix capitalization (e.g. 'JPMorgan').")
+
+class ExperienceBreakdown(BaseModel):
+    # Advisory / Services
+    consulting: SectorExperience = Field(description="Strategy/Management Consulting firms (McKinsey, Bain, etc).")
+    audit: SectorExperience = Field(description="Audit firms (Big4).")
+    ib: SectorExperience = Field(description="Investment Banking roles (GS, JPM, Morgan Stanley).")
+    pe: SectorExperience = Field(description="Private Equity funds (Blackstone, KKR).")
+    vc: SectorExperience = Field(description="Venture Capital funds (Sequoia, a16z).")
+    
+    # Technical / Founder
+    engineer_role: SectorExperience = Field(description="Technical engineering roles.")
+    lawyer: SectorExperience = Field(description="Legal roles in law firms or in-house counsel.")
+    founder: SectorExperience = Field(description="Founded their own company.")
+
+    # Corporate / Industry (Management)
+    management: SectorExperience = Field(description="CRITICAL: Roles inside REAL companies (Retail, Tech, Industrial). EXCLUDE Consulting/Banks/Advisors here. Only actual employment.")
+    corp_ma: SectorExperience = Field(description="Internal M&A/CorpDev roles inside a real company.")
+    
+    # Portfolio Roles
+    portco_roles: SectorExperience = Field(description="C-Level/Management roles in companies explicitly owned by PE funds.")
+
+class GeneralData(BaseModel):
+    international_locations: List[str] = Field(description="List of countries where candidate LIVED & WORKED > 6 months. Exclude deal locations.")
+    industries_specialized: List[str] = Field(description="Industries where candidate held MANAGEMENT roles (Real companies). Exclude industries they only advised as a consultant. Generic category only (e.g., 'Tech', 'Energy', 'Healthcare').")
+
+class Education(BaseModel):
+    bachelors: List[str] = Field(description="Generic category only (e.g., 'Engineering', 'Law', 'Business').")
+    masters: List[str] = Field(description="Generic category only.")
+    mba: str = Field(description="Name of the Business School if exists, else 'No'.")
+    university: List[str] = Field(description="School names.")
+
+class CVData(BaseModel):
+    name: str
+    email: Optional[str]
+    phone: Optional[str]
+    linkedin_url: Optional[str]
+    total_years: float = Field(description="Total professional experience sum.")
+    
+    education: Education
+    experience: ExperienceBreakdown
+    general: GeneralData
+    languages: List[str] = Field(description="Language names only.")
+
+# --- CLASE PRINCIPAL ---
+
+class AnalizadorCV:
+    def __init__(self):
+        key = os.getenv("OPENAI_API_KEY")
+        if not key: raise ValueError("Falta OPENAI_API_KEY en .env")
+        self.client = OpenAI(api_key=key)
+        self.model_name = "gpt-5-mini" 
+
+    def _leer_pdf(self, ruta_archivo):
+        texto = ""
+        try:
+            with pdfplumber.open(ruta_archivo) as pdf:
+                for pagina in pdf.pages:
+                    texto += (pagina.extract_text() or "") + "\n"
+            return texto
+        except Exception as e:
+            print(f"   [IA ERROR] Leyendo PDF: {e}")
+            return None
+
+    def procesar_cv(self, ruta_archivo):
+        print("      -> Analizando con IA...")
+        texto_cv = self._leer_pdf(ruta_archivo)
+        if not texto_cv: return None
+
+        texto_cv = texto_cv[:20000]
+
+        prompt_system = """
+        You are an elite Headhunter data entry specialist. Your job is to extract data from CVs with extreme precision and standardize it.
+
+        ### CAPITALIZATION & CLEANING RULES (Apply to ALL text fields)
+        1. **Title Case**: Always convert names to standard business casing (e.g., "KEARNEY" -> "Kearney", "mckinsey" -> "McKinsey", "jp morgan" -> "JP Morgan").
+        2. **Clean Names**: Remove legal suffixes (Ltd, Inc, S.A, GmbH). Remove division names unless vital (e.g., "Santander CIB" -> "Santander", "Deloitte T&T" -> "Deloitte").
+
+        ### EXPERIENCE RULES (The Golden Rules)
+        1. **Management (at companies)**: Include ONLY real companies (Retail, Pharma, Tech, etc.). NEVER include Consulting firms (McKinsey), Big4, or Banks here.
+        2. **PE PortCo Roles**: Only include if the candidate explicitly states the company was a Private Equity Portfolio Company during their tenure.
+        3. **Corporate M&A**: Only internal M&A/Integration roles at real companies. Exclude IB/Advisory deals.
+        4. **Industries**: Only list industries where the candidate was an EMPLOYEE (Management). Do not list industries they advised as a consultant. Generic category only (e.g., 'Tech', 'Energy', 'Healthcare').
+        5. **International**: Only countries where they LIVED and WORKED for >6 months. Ignore project travel.
+
+        ### EDUCATION RULES
+        1. **Simplification**: Map specific degrees to: 'Engineering', 'Law', 'Economics', 'Business', 'Science', 'Humanities'.
+        2. **MBA**: If present, extract ONLY the School Name (e.g., "INSEAD", "Harvard"). If none, output "No".
+
+        ### OUTPUT
+        Extract strictly into the JSON schema provided.
+        """
+
+        try:
+            completion = self.client.beta.chat.completions.parse(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": prompt_system},
+                    {"role": "user", "content": f"CV Content:\n{texto_cv}"},
+                ],
+                response_format=CVData,
+            )
+            return completion.choices[0].message.parsed.model_dump()
+
+        except Exception as e:
+            print(f"   [IA ERROR] OpenAI: {e}")
+            return None
+
+============================================================
+RUTA: .\core\data_mapper.py
+============================================================
+from datetime import date
+
+class DataMapper:
+    YEAR_TAGS = {
+        "0-3 Years", "3-5 Years", "5-7 Years", "7-10 Years", 
+        "10-15 Years", "15+ Years", "No"
+    }
+
+    # --- HELPERS DE LECTURA (Notion -> Python) ---
+    @staticmethod
+    def _extract_tags(prop_data):
+        """Extrae etiquetas tanto de Multi-Select como de Select."""
+        if not prop_data: return []
+        if "multi_select" in prop_data:
+            return [item["name"] for item in prop_data["multi_select"]]
+        if "select" in prop_data and prop_data["select"]:
+            return [prop_data["select"]["name"]]
+        return []
+
+    @staticmethod
+    def _extract_text(prop_data):
+        """Extrae texto plano de RichText o Title."""
+        if not prop_data: return None
+        if "rich_text" in prop_data:
+            parts = prop_data["rich_text"]
+            return "".join([p["plain_text"] for p in parts]) if parts else None
+        if "title" in prop_data:
+            parts = prop_data["title"]
+            return "".join([p["plain_text"] for p in parts]) if parts else None
+        return None
+
+    @staticmethod
+    def _extract_select_name(prop_data):
+        if not prop_data: return None
+        select = prop_data.get("select")
+        return select["name"] if select else None
+
+    @staticmethod
+    def _reconstruct_experience_object(tag_list):
+        companies = []
+        years_range = None
+        for tag in tag_list:
+            if tag in DataMapper.YEAR_TAGS:
+                years_range = tag
+            elif tag != "No":
+                companies.append(tag)
+        return {
+            "companies": companies,
+            "years_range": years_range,
+            "has_experience": len(companies) > 0
+        }
+
+    # --- HELPERS DE ESCRITURA (Python -> Notion) ---
+    @staticmethod
+    def _get_years_range_tag(years_float):
+        y = years_float
+        if not y or y <= 0: return None
+        if y < 3: return "0-3 Years"
+        if y < 5: return "3-5 Years"
+        if y < 7: return "5-7 Years"
+        if y < 10: return "7-10 Years"
+        if y < 15: return "10-15 Years"
+        return "15+ Years"
+
+    @staticmethod
+    def _format_multi_select(items_list):
+        if not items_list: return []
+        return [{"name": str(i)[:100].strip().replace(",", "")} for i in items_list]
+
+    @staticmethod
+    def _create_experience_tags(sector_data):
+        tags = []
+        if not sector_data or not sector_data.get("has_experience"):
+            return [{"name": "No"}]
+
+        companies = sector_data.get("companies", [])
+        for c in companies:
+            if c: tags.append({"name": str(c)[:100].strip().replace(",", "")})
+            
+        years = sector_data.get("years", 0)
+        range_tag = DataMapper._get_years_range_tag(years)
+        if range_tag:
+            tags.append({"name": range_tag})
+            
+        if not tags: return [{"name": "No"}]
+        return tags
+
+    # --- MAPEO PRINCIPAL: AI -> NOTION (Usado por Harvester) ---
+    @staticmethod
+    def map_to_notion(candidate_data, public_cv_url, process_name, existing_history=None):
+        """
+        Construye el payload para crear/actualizar una página en Notion.
+        existing_history: Lista de strings con los procesos anteriores (si existen).
+        """
+        exp = candidate_data.get("experience", {})
+        edu = candidate_data.get("education", {})
+        gen = candidate_data.get("general", {})
+        
+        # 1. Gestión del Historial de Procesos
+        history_list = existing_history if existing_history else []
+        if process_name not in history_list:
+            history_list.append(process_name)
+        
+        history_tags = [{"name": p} for p in history_list[-100:]]
+
+        props = {
+            "Name": {"title": [{"text": {"content": candidate_data["name"][:200]}}]},
+            "Phone": {"phone_number": candidate_data.get("phone")},
+            "LinkedIn": {"url": candidate_data.get("linkedin_url")},
+            "CV": {"files": [{"name": "CV.pdf", "external": {"url": public_cv_url}}]},
+            "Date Added": {"date": {"start": date.today().isoformat()}},
+            "Last Process Involved in": {"select": {"name": process_name}},
+            "Process History": {"multi_select": history_tags}
+        }
+        
+        if candidate_data.get("email"):
+            props["Email"] = {"email": candidate_data.get("email")}
+
+        rango_total = DataMapper._get_years_range_tag(candidate_data.get("total_years", 0))
+        if rango_total:
+            props["EXPERIENCE: Total Years"] = {"select": {"name": rango_total}}
+
+        sector_mapping = {
+            "EXPERIENCE: Consulting": exp.get("consulting"),
+            "EXPERIENCE: Audit": exp.get("audit"),
+            "EXPERIENCE: Investment Banking": exp.get("ib"),
+            "EXPERIENCE: Private Equity": exp.get("pe"),
+            "EXPERIENCE: Venture Capital": exp.get("vc"),
+            "EXPERIENCE: Engineer": exp.get("engineer_role"),
+            "EXPERIENCE: Lawyer": exp.get("lawyer"),
+            "EXPERIENCE: Founder": exp.get("founder"),
+            "EXPERIENCE: Management (at companies)": exp.get("management"),
+            "EXPERIENCE: Corporate M&A or Integrations": exp.get("corp_ma"),
+            "EXPERIENCE: PE PortCo Roles": exp.get("portco_roles")
+        }
+
+        for prop_name, data in sector_mapping.items():
+            props[prop_name] = {"multi_select": DataMapper._create_experience_tags(data)}
+
+        props["EXPERIENCE: International"] = {"multi_select": DataMapper._format_multi_select(gen.get("international_locations"))}
+        props["EXPERIENCE: Industries"] = {"multi_select": DataMapper._format_multi_select(gen.get("industries_specialized"))}
+        props["Languages"] = {"multi_select": DataMapper._format_multi_select(candidate_data.get("languages"))}
+
+        props["EDUCATION: Bachelors"] = {"multi_select": DataMapper._format_multi_select(edu.get("bachelors"))}
+        props["EDUCATION: Masters"] = {"multi_select": DataMapper._format_multi_select(edu.get("masters"))}
+        props["EDUCATION: University"] = {"multi_select": DataMapper._format_multi_select(edu.get("university"))}
+        
+        mba_val = edu.get("mba", "No")
+        props["EDUCATION: MBA"] = {"multi_select": [{"name": mba_val}]}
+
+        return props
+
+    # --- MAPEO SUPABASE (Usado por Harvester) ---
+    @staticmethod
+    def map_to_supabase_candidate(candidate_data, public_cv_url):
+        return {
+            "name": candidate_data["name"],
+            "email": candidate_data.get("email"),
+            "linkedin_url": candidate_data.get("linkedin_url"),
+            "cv_url": public_cv_url,
+            "candidate_data": candidate_data, 
+            "updated_at": "now()"
+        }
+
+    # --- MAPEO INVERSO (Usado por Observer) ---
+    @staticmethod
+    def map_notion_to_supabase_update(notion_props):
+        data = {}
+        
+        # 1. Datos Clave
+        raw_name = notion_props.get("Name", {}).get("title", [])
+        if raw_name: data["name"] = raw_name[0]["plain_text"]
+        
+        email = notion_props.get("Email", {}).get("email")
+        data["email"] = email if email else None
+        
+        linkedin = notion_props.get("LinkedIn", {}).get("url")
+        data["linkedin_url"] = linkedin if linkedin else None
+
+        # 2. Campos Extra
+        extra_data = {
+            "cultural_fit": DataMapper._extract_tags(notion_props.get("Cultural Fit")),
+            "capabilities_assessment": DataMapper._extract_tags(notion_props.get("Capabilities Assessment")),
+            "referred_by": DataMapper._extract_text(notion_props.get("Referred by/Sourced from...")),
+            
+            # --- CORRECCIÓN CLAVE AQUÍ: LEER LAS NUEVAS COLUMNAS ---
+            "last_process": DataMapper._extract_select_name(notion_props.get("Last Process Involved in")),
+            "process_history": DataMapper._extract_tags(notion_props.get("Process History"))
+        }
+
+        # 3. Mapeo Inverso Experiencia
+        exp_fields_map = {
+            "EXPERIENCE: Consulting": "consulting",
+            "EXPERIENCE: Audit": "audit",
+            "EXPERIENCE: Investment Banking": "ib",
+            "EXPERIENCE: Private Equity": "pe",
+            "EXPERIENCE: Venture Capital": "vc",
+            "EXPERIENCE: Engineer": "engineer_role",
+            "EXPERIENCE: Lawyer": "lawyer",
+            "EXPERIENCE: Founder": "founder",
+            "EXPERIENCE: Management (at companies)": "management",
+            "EXPERIENCE: Corporate M&A or Integrations": "corp_ma",
+            "EXPERIENCE: PE PortCo Roles": "portco_roles"
+        }
+
+        candidate_data_json = {
+            "name": data.get("name"),
+            "email": data.get("email"),
+            "linkedin_url": data.get("linkedin_url"),
+            "total_years_range": DataMapper._extract_select_name(notion_props.get("EXPERIENCE: Total Years")),
+            "languages": DataMapper._extract_tags(notion_props.get("Languages")),
+            
+            # Guardamos los datos de proceso dentro de 'general' o en la raíz, donde prefieras.
+            # Los guardaré en la raíz del JSON para fácil acceso.
+            "last_process": extra_data["last_process"],
+            "process_history": extra_data["process_history"],
+            
+            "general": {
+                "international_locations": DataMapper._extract_tags(notion_props.get("EXPERIENCE: International")),
+                "industries_specialized": DataMapper._extract_tags(notion_props.get("EXPERIENCE: Industries")),
+                "cultural_fit": extra_data["cultural_fit"],
+                "capabilities": extra_data["capabilities_assessment"],
+                "source": extra_data["referred_by"]
+            },
+            "education": {
+                "bachelors": DataMapper._extract_tags(notion_props.get("EDUCATION: Bachelors")),
+                "masters": DataMapper._extract_tags(notion_props.get("EDUCATION: Masters")),
+                "university": DataMapper._extract_tags(notion_props.get("EDUCATION: University")),
+                "mba": DataMapper._extract_tags(notion_props.get("EDUCATION: MBA"))
+            },
+            "experience": {}
+        }
+
+        for notion_col, json_key in exp_fields_map.items():
+            tags = DataMapper._extract_tags(notion_props.get(notion_col))
+            candidate_data_json["experience"][json_key] = DataMapper._reconstruct_experience_object(tags)
+
+        data["candidate_data"] = candidate_data_json
+        data["updated_at"] = "now()"
+        
+        return data
+
+============================================================
+RUTA: .\core\guidelines_parser.py
+============================================================
+import os
+import re
+from core.notion_client import NotionClient
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GUIDELINES_DB_ID = os.getenv("NOTION_GUIDELINES_DB_ID")
+
+class GuidelinesParser:
+    def __init__(self, notion_client: NotionClient):
+        self.notion = notion_client
+        self.guidelines_ds_id = None
+
+    def _init_datasource(self):
+        if not self.guidelines_ds_id and GUIDELINES_DB_ID:
+            self.guidelines_ds_id = self.notion.get_data_source_id(GUIDELINES_DB_ID) or GUIDELINES_DB_ID
+
+    def buscar_documento_guidelines(self, process_type_string):
+        self._init_datasource()
+        if not self.guidelines_ds_id: return None
+        
+        partes = process_type_string.split(" - ")
+        if len(partes) < 2: return None
+            
+        prefijo = partes[0].strip()
+        rol = partes[1].strip()
+        
+        filtros = []
+        if prefijo == "PortCo":
+            filtros = [
+                {"property": "Company", "select": {"equals": "PortCo"}},
+                {"property": "Role", "select": {"equals": rol}}
+            ]
+        else:
+            filtros = [
+                {"property": "Company", "select": {"equals": "Nzyme"}},
+                {"property": "Team", "select": {"equals": prefijo}},
+                {"property": "Role", "select": {"equals": rol}}
+            ]
+
+        filtro_final = {
+            "and": [
+                {"property": "Document Type", "select": {"equals": "Interview Stages"}}
+            ] + filtros
+        }
+        
+        resultados = self.notion.query_data_source(self.guidelines_ds_id, filtro_final)
+        return resultados[0] if resultados else None
+
+    def buscar_candidate_template_id(self, parent_page_id):
+        bloques = self.notion.get_page_blocks(parent_page_id)
+        for b in bloques:
+            if b["type"] == "child_page":
+                titulo = b["child_page"].get("title", "")
+                if "candidate template" in titulo.lower():
+                    print(f"   [TEMPLATE] Encontrado: {titulo} ({b['id']})")
+                    return b["id"]
+        return None
+
+    # --- METODOS DE PARSEO DE STAGES ---
+    
+    def _limpiar_celda(self, texto):
+        if not texto: return ""
+        return texto.strip().replace("\n", " ")
+
+    def _determinar_color(self, stage_num):
+        if not stage_num: return "default"
+        match = re.match(r"(\d+)", stage_num)
+        if not match: return "default"
+        num = int(match.group(1))
+        colores = {0: "gray", 1: "brown", 2: "orange", 3: "purple", 4: "blue", 5: "pink", 6: "yellow", 7: "red"}
+        return colores.get(num, "default")
+
+    def parsear_stages_desde_pagina(self, page_id):
+        print(f"   [PARSER] Analizando pagina {page_id}...")
+        bloques = self.notion.get_page_blocks(page_id)
+        
+        stages_dinamicos = []
+        nombres_usados = set()
+        ultimo_numero_stage = "0"
+        
+        # 1. Definimos los Fijos (Cierres)
+        # Como has borrado los del template, estos se crearán AL FINAL de la lista.
+        stages_fijos = [
+            {"name": "Offer", "color": "green"}, 
+            {"name": "Hired", "color": "blue"}, 
+            {"name": "Rejected", "color": "red"},
+            {"name": "Lost", "color": "gray"}
+        ]
+        # Creamos un set de nombres fijos para evitar que si alguien escribe "Offer" en la tabla, se duplique
+        nombres_fijos = {s["name"] for s in stages_fijos}
+
+        # 2. Leer Tabla (Dinámicos)
+        for bloque in bloques:
+            if bloque["type"] == "table":
+                filas = self.notion.get_page_blocks(bloque["id"])
+                for fila in filas:
+                    if fila["type"] != "table_row": continue
+                    cells = fila["table_row"].get("cells", [])
+                    if len(cells) < 2: continue 
+                    
+                    col_num = self._limpiar_celda("".join([t["plain_text"] for t in cells[0]]))
+                    col_name = self._limpiar_celda("".join([t["plain_text"] for t in cells[1]]))
+                    
+                    if "Interview Type" in col_name or "#" in col_num: continue
+
+                    nombre_final = None
+                    color = "default"
+                    
+                    if col_num and col_num[0].isdigit():
+                        ultimo_numero_stage = col_num.split('.')[0]
+                        nombre_final = f"{col_num} {col_name}"
+                        color = self._determinar_color(col_num)
+                    elif "Group Decision" in col_name or "Round" in col_name:
+                        nombre_final = f"{ultimo_numero_stage}. [ROUND DECISION]"
+                        color = self._determinar_color(ultimo_numero_stage)
+
+                    # Si el nombre es válido, no está repetido y NO es uno de los fijos...
+                    if nombre_final and nombre_final not in nombres_usados and nombre_final not in nombres_fijos:
+                        nombre_final = nombre_final[:100]
+                        stages_dinamicos.append({"name": nombre_final, "color": color})
+                        nombres_usados.add(nombre_final)
+
+        # 3. Construcción Final de la Lista
+        # Al estar la base de datos vacía, Notion respetará escrupulosamente este orden:
+        # [1. Screening, 2. Interview... , Offer, Hired, Rejected, Lost]
+        lista_final = stages_dinamicos + stages_fijos
+        
+        return lista_final
+
+============================================================
+RUTA: .\core\notion_client.py
+============================================================
+import os
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class NotionClient:
+    def __init__(self):
+        self.token = os.getenv("NOTION_KEY")
+        self.base_url = "https://api.notion.com/v1"
+        
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "Notion-Version": "2025-09-03"
+        }
+
+    def get_data_source_id(self, database_id):
+        """Obtiene el ID del Data Source subyacente (Vital para API 2025)."""
+        url = f"{self.base_url}/databases/{database_id}"
+        response = requests.get(url, headers=self.headers)
+        if response.status_code == 200:
+            data = response.json()
+            sources = data.get("data_sources", [])
+            if sources: return sources[0]["id"]
+        return None
+
+    def get_page_blocks(self, block_id):
+        """Descarga el contenido de una página (para inspeccionar hijos)."""
+        url = f"{self.base_url}/blocks/{block_id}/children?page_size=100"
+        response = requests.get(url, headers=self.headers)
+        if response.status_code == 200:
+            return response.json().get("results", [])
+        return []
+
+    def query_data_source(self, data_source_id, filter_params):
+        """Consulta datos usando el Data Source ID."""
+        url = f"{self.base_url}/data_sources/{data_source_id}/query"
+        payload = {}
+        if filter_params: payload["filter"] = filter_params
+        
+        response = requests.post(url, headers=self.headers, json=payload)
+        if response.status_code == 200:
+            return response.json().get("results", [])
+        print(f"[API ERROR] Query failed ({response.status_code}): {response.text}")
+        return []
+
+    def update_database(self, database_id, title=None):
+        """
+        Modifica el CONTENEDOR (Base de Datos). 
+        Usado para cambiar el Título.
+        """
+        url = f"{self.base_url}/databases/{database_id}"
+        payload = {}
+        if title:
+            payload["title"] = [{"text": {"content": title}}]
+            
+        response = requests.patch(url, headers=self.headers, json=payload)
+        return response
+
+    def update_data_source(self, data_source_id, properties):
+        """
+        Modifica el ESQUEMA (Data Source).
+        Usado para inyectar Stages y configurar Relaciones.
+        """
+        url = f"{self.base_url}/data_sources/{data_source_id}"
+        payload = {"properties": properties}
+        
+        response = requests.patch(url, headers=self.headers, json=payload)
+        return response
+
+    def update_page(self, page_id, properties=None):
+        """Actualiza propiedades de una página."""
+        url = f"{self.base_url}/pages/{page_id}"
+        payload = {}
+        if properties: payload["properties"] = properties
+        
+        response = requests.patch(url, headers=self.headers, json=payload)
+        return response
+
+    def create_page_in_db(self, database_id, properties):
+        """Crea una página en la Main DB."""
+        ds_id = self.get_data_source_id(database_id)
+        target_id = ds_id if ds_id else database_id
+        
+        url = f"{self.base_url}/pages"
+        parent_struct = {
+            "type": "data_source_id" if ds_id else "database_id",
+            "data_source_id" if ds_id else "database_id": target_id
+        }
+        
+        payload = {"parent": parent_struct, "properties": properties}
+        response = requests.post(url, headers=self.headers, json=payload)
+        return response
+    
+    def get_database_schema(self, data_source_id):
+        """Lee las propiedades (útil para detectar nombre de columnas)."""
+        url = f"{self.base_url}/data_sources/{data_source_id}"
+        response = requests.get(url, headers=self.headers)
+        if response.status_code == 200: return response.json().get("properties", {})
+        return {}
+
+============================================================
+RUTA: .\core\storage_client.py
+============================================================
+import os
+import requests
+import time
+from supabase import create_client
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class StorageClient:
+    def __init__(self):
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+        
+        if not url or not key:
+            raise ValueError("Faltan credenciales de Supabase en .env")
+
+        self.supabase = create_client(url, key)
+        self.bucket_name = "cv-archive" # Asegurate de que este bucket existe en Supabase y es Publico
+
+    def subir_cv_desde_url(self, notion_url, nombre_archivo):
+        """
+        Descarga el archivo de Notion (temporal) y lo sube a Supabase (permanente).
+        Retorna la URL publica.
+        """
+        try:
+            # 1. Descargar de Notion
+            response = requests.get(notion_url)
+            if response.status_code != 200:
+                print(f"      [ERROR STORAGE] No se pudo descargar de Notion: {response.status_code}")
+                return None
+            
+            file_content = response.content
+            
+            # 2. Limpiar nombre y hacerlo unico
+            # Quitamos caracteres raros y añadimos timestamp para evitar colisiones
+            safe_name = "".join([c for c in nombre_archivo if c.isalnum() or c in "._-"]).strip()
+            timestamp = int(time.time())
+            path = f"{timestamp}_{safe_name}"
+
+            # 3. Subir a Supabase Storage
+            # 'upsert': 'true' permite sobrescribir si por casualidad existiera
+            res = self.supabase.storage.from_(self.bucket_name).upload(
+                path=path,
+                file=file_content,
+                file_options={"content-type": "application/pdf", "upsert": "true"}
+            )
+            
+            # 4. Obtener URL Publica
+            # La libreria devuelve la URL directamente con get_public_url
+            public_url = self.supabase.storage.from_(self.bucket_name).get_public_url(path)
+            
+            return public_url
+
+        except Exception as e:
+            print(f"      [EXCEPCION STORAGE] {e}")
+            return None
+
+============================================================
+RUTA: .\core\supabase_client.py
+============================================================
+import os
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class SupabaseManager:
+    def __init__(self):
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+        if not url or not key:
+            raise ValueError("Faltan credenciales de Supabase en .env")
+        self.client: Client = create_client(url, key)
+
+    # --- GESTIÓN DE PROCESOS ---
+    def registrar_proceso(self, notion_wf_id, notion_form_id, nombre, tipo):
+        data = {
+            "notion_workflow_id": notion_wf_id,
+            "notion_form_id": notion_form_id,
+            "process_name": nombre,
+            "process_type": tipo,
+            "status": "Open"
+        }
+        try:
+            self.client.table("processes").insert(data).execute()
+            print(f"   [SUPABASE] Proceso registrado: {nombre}")
+            return True
+        except Exception as e:
+            print(f"   [SUPABASE ERROR] Fallo al registrar proceso: {e}")
+            return False
+
+    def obtener_procesos_activos(self):
+        try:
+            response = self.client.table("processes").select("*").eq("status", "Open").execute()
+            return response.data
+        except Exception as e:
+            print(f"   [SUPABASE ERROR] Error leyendo procesos activos: {e}")
+            return []
+
+    # --- NUEVO MÉTODO QUE FALTABA ---
+    def actualizar_estado_proceso_por_nombre(self, nombre, nuevo_estado):
+        """Actualiza el status (Open/Closed) basado en el nombre del proceso."""
+        try:
+            self.client.table("processes").update({
+                "status": nuevo_estado,
+                "updated_at": "now()"
+            }).eq("process_name", nombre).execute()
+            return True
+        except Exception as e:
+            print(f"      [SUPABASE ERROR] Fallo actualizando proceso: {e}")
+            return False
+
+    # --- GESTIÓN DE CANDIDATOS (IDENTITY ENGINE) ---
+    def gestion_candidato(self, candidate_data, notion_page_id):
+        """
+        Lógica Blindada de Identidad:
+        1. Busca si ya existe alguien con este 'notion_page_id'.
+        2. Si no, busca si existe alguien con este 'email' (Legacy Match).
+        3. Si encuentra -> Actualiza (y guarda el notion_id si no lo tenía).
+        4. Si no -> Crea uno nuevo.
+        """
+        try:
+            # A. Preparar datos
+            candidate_data["notion_page_id"] = notion_page_id 
+            email = candidate_data.get("email")
+            
+            # B. Buscar existente (OR Logic)
+            query = self.client.table("Nzyme_Talent_Network").select("id")
+            
+            # Construimos filtro: notion_page_id = X ...
+            or_filter = f"notion_page_id.eq.{notion_page_id}"
+            # ... OR email = Y (Solo si hay email)
+            if email:
+                or_filter += f",email.eq.{email}"
+            
+            existing = query.or_(or_filter).execute()
+
+            if existing.data:
+                # C. UPDATE (Ya existe)
+                cid = existing.data[0]['id']
+                # Actualizamos todo
+                self.client.table("Nzyme_Talent_Network").update(candidate_data).eq("id", cid).execute()
+                return cid
+            else:
+                # D. INSERT (Nuevo)
+                response = self.client.table("Nzyme_Talent_Network").insert(candidate_data).execute()
+                if response.data: return response.data[0]['id']
+                return None
+
+        except Exception as e:
+            print(f"      [SUPABASE ERROR] Fallo gestión candidato: {e}")
+            return None
+
+    # --- GESTIÓN DE APLICACIONES ---
+    def crear_aplicacion(self, candidate_uuid, notion_wf_id, notion_page_id, stage_inicial):
+        try:
+            proc_res = self.client.table("processes").select("id").eq("notion_workflow_id", notion_wf_id).execute()
+            if not proc_res.data: return False
+            process_uuid = proc_res.data[0]['id']
+
+            app_data = {
+                "candidate_id": candidate_uuid,
+                "process_id": process_uuid,
+                "notion_page_id": notion_page_id,
+                "current_stage": stage_inicial,
+                "status": "Active"
+            }
+            self.client.table("applications").upsert(
+                app_data, on_conflict="candidate_id, process_id"
+            ).execute()
+            return True
+        except Exception as e:
+            print(f"      [SUPABASE ERROR] Fallo creando aplicación: {e}")
+            return False
+
+    # --- OBSERVER METHODS ---
+    def obtener_aplicacion_por_notion_id(self, notion_page_id):
+        try:
+            res = self.client.table("applications").select("id, current_stage").eq("notion_page_id", notion_page_id).execute()
+            if res.data: return res.data[0]
+            return None
+        except: return None
+
+    def registrar_cambio_stage(self, app_id, old_stage, new_stage):
+        try:
+            self.client.table("applications").update({
+                "current_stage": new_stage, 
+                "updated_at": "now()"
+            }).eq("id", app_id).execute()
+
+            self.client.table("process_history").insert({
+                "application_id": app_id,
+                "from_stage": old_stage,
+                "to_stage": new_stage
+            }).execute()
+            print(f"      [ANALYTICS] Movimiento registrado: {old_stage} -> {new_stage}")
+            return True
+        except Exception as e:
+            print(f"      [OBSERVER ERROR] {e}")
+            return False
+
+============================================================
+RUTA: .\scripts\debug_schema.py
+============================================================
+import sys
+import os
+import json
+from dotenv import load_dotenv
+
+# Añadimos la ruta raíz para importar core
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.notion_client import NotionClient
+
+load_dotenv()
+
+MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
+
+def analizar_schema():
+    print("--- INSPECTOR DE ESQUEMA NOTION ---")
+    client = NotionClient()
+    
+    if not MAIN_DB_ID:
+        print("ERROR: No tienes NOTION_MAIN_DB_ID en el .env")
+        return
+
+    print(f"Consultando DB: {MAIN_DB_ID}...")
+    
+    # Usamos requests directamente para obtener la metadata de la DB
+    url = f"https://api.notion.com/v1/databases/{MAIN_DB_ID}"
+    res = client.get_database_schema(client.get_data_source_id(MAIN_DB_ID) or MAIN_DB_ID)
+    
+    # Nota: get_database_schema en tu cliente actual devuelve solo 'properties'.
+    # Vamos a usar eso.
+    
+    if not res:
+        # Fallback: intentamos pedir la DB entera para ver si hay error de acceso
+        import requests
+        headers = client.headers
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            print(f"❌ ERROR FATAL DE ACCESO: {response.status_code}")
+            print(response.text)
+            return
+        res = response.json().get("properties", {})
+
+    print(f"\n✅ Conexión exitosa. Listando columnas detectadas:\n")
+    print(f"{'NOMBRE COLUMNA (CLAVE)':<40} | {'TIPO':<15}")
+    print("-" * 60)
+    
+    for name, data in res.items():
+        tipo = data['type']
+        print(f"'{name}'".ljust(40) + f" | {tipo}")
+
+    print("\n--- INSTRUCCIONES ---")
+    print("Compara la lista de arriba con tu archivo 'core/data_mapper.py'.")
+    print("Busca diferencias exactas (mayúsculas, espacios al final, plurales).")
+
+if __name__ == "__main__":
+    analizar_schema()
+
+============================================================
+RUTA: .\scripts\factory_worker.py
+============================================================
+import sys
+import os
+import time
+from dotenv import load_dotenv
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.notion_client import NotionClient
+from core.supabase_client import SupabaseManager
+from core.guidelines_parser import GuidelinesParser
+
+load_dotenv()
+
+# --- CONFIGURACIÓN ---
+PROCESS_DASHBOARD_DB_ID = os.getenv("NOTION_PROCESS_DASHBOARD_DB_ID")
+MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
+POLLING_INTERVAL = 10 
+
+class FactoryWorkerV2:
+    def __init__(self):
+        self.notion = NotionClient()
+        self.supa = SupabaseManager()
+        self.parser = GuidelinesParser(self.notion)
+        self.dashboard_ds_id = None
+
+    def _init_datasources(self):
+        if not self.dashboard_ds_id and PROCESS_DASHBOARD_DB_ID:
+            print("Resolviendo Dashboard Data Source...")
+            self.dashboard_ds_id = self.notion.get_data_source_id(PROCESS_DASHBOARD_DB_ID) or PROCESS_DASHBOARD_DB_ID
+
+    def buscar_solicitudes_pendientes(self):
+        """Busca páginas creadas por el botón (Ready=True, Processed=False)."""
+        if not self.dashboard_ds_id: return []
+        
+        filtro = {
+            "and": [
+                {"property": "Ready to be Processed [Do not touch]", "checkbox": {"equals": True}},
+                {"property": "Processed [Do not touch]", "checkbox": {"equals": False}}
+            ]
+        }
+        return self.notion.query_data_source(self.dashboard_ds_id, filtro)
+
+    def configurar_proceso(self, pagina_padre):
+        page_id = pagina_padre["id"]
+        props = pagina_padre["properties"]
+        
+        # 1. Extraer Datos del Dashboard
+        try:
+            raw_title = props.get("Name", {}).get("title", [])
+            if not raw_title: return
+            nombre_proceso = raw_title[0]["plain_text"]
+            
+            raw_select = props.get("Process Type", {}).get("select")
+            if not raw_select: return 
+            tipo_proceso = raw_select["name"]
+            
+            print(f"--> Configurando: {nombre_proceso} ({tipo_proceso})")
+        except Exception as e:
+            print(f"   [ERROR DATOS] {e}")
+            return
+
+        # 2. Espera de Seguridad (Vital para templates)
+        print("   Esperando 10s para propagación de estructura interna...")
+        time.sleep(10)
+
+        # 3. Identificar Bases de Datos Hijas (Introspección)
+        bloques = self.notion.get_page_blocks(page_id)
+        wf_db_id = None
+        form_db_id = None
+
+        for b in bloques:
+            if b["type"] == "child_database":
+                titulo = b.get("child_database", {}).get("title", "").lower()
+                bid = b["id"]
+                if "workflow" in titulo:
+                    wf_db_id = bid
+                    print(f"   Detectado WORKFLOW: {bid}")
+                elif "form" in titulo:
+                    form_db_id = bid
+                    print(f"   Detectado FORM: {bid}")
+
+        if not wf_db_id or not form_db_id:
+            print("   [ERROR CRITICO] No se encontraron las DBs hijas. Revisa el template del botón.")
+            return
+
+        # 4. Obtener Stages de Guidelines
+        doc_guidelines = self.parser.buscar_documento_guidelines(tipo_proceso)
+        opciones_stages = []
+        if doc_guidelines:
+            opciones_stages = self.parser.parsear_stages_desde_pagina(doc_guidelines["id"])
+            print(f"   Stages extraidos: {len(opciones_stages)}")
+        else:
+            print("   [AVISO] Guidelines no encontrados. Se usarán stages por defecto.")
+
+        # --- 5. CONFIGURAR WORKFLOW (RENOMBRADO + STAGES) ---
+        print("   Configurando Workflow DB...")
+        
+        # A. Renombrar (Database Update)
+        self.notion.update_database(wf_db_id, title=f"Workflow - {nombre_proceso}")
+        
+        # B. Inyectar Stages (Data Source Update)
+        if opciones_stages:
+            wf_ds_id = self.notion.get_data_source_id(wf_db_id)
+            if wf_ds_id:
+                print(f"   Inyectando stages en Data Source {wf_ds_id}...")
+                wf_updates = {"Stage": {"select": {"options": opciones_stages}}}
+                
+                res_schema = self.notion.update_data_source(wf_ds_id, properties=wf_updates)
+                if res_schema.status_code != 200:
+                    print(f"   [ERROR STAGES] {res_schema.status_code}: {res_schema.text}")
+            else:
+                print("   [ERROR] No se pudo resolver Data Source ID del Workflow.")
+
+        # --- 6. CONFIGURAR FORM DB (RENOMBRADO) ---
+        print("   Configurando Form DB...")
+        self.notion.update_database(form_db_id, title=f"Form - {nombre_proceso}")
+
+        # --- 7. REGISTRAR EN SUPABASE (BACKEND) ---
+        # Guardamos en la tabla 'processes'
+        exito_supa = self.supa.registrar_proceso(wf_db_id, form_db_id, nombre_proceso, tipo_proceso)
+
+        # 8. CIERRE
+        if exito_supa:
+            print("   Finalizando tarea...")
+            self.notion.update_page(page_id, properties={"Processed [Do not touch]": {"checkbox": True}})
+            print("   [EXITO] Proceso listo para recibir candidatos.")
+        else:
+            print("   [ERROR SUPABASE] Fallo al registrar. No se marca como procesado.")
+
+    def run(self):
+        print("--- FACTORY WORKER V5 ---")
+        self._init_datasources()
+        try:
+            while True:
+                solicitudes = self.buscar_solicitudes_pendientes()
+                if solicitudes: print(f"Detectadas {len(solicitudes)} solicitudes nuevas.")
+                for sol in solicitudes: self.configurar_proceso(sol)
+                time.sleep(POLLING_INTERVAL)
+        except KeyboardInterrupt: print("Apagando.")
+
+if __name__ == "__main__":
+    FactoryWorkerV2().run()
+
+============================================================
+RUTA: .\scripts\harvester.py
+============================================================
+import sys
+import os
+import time
+import re
+import requests
+from dotenv import load_dotenv
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.notion_client import NotionClient
+from core.supabase_client import SupabaseManager
+from core.storage_client import StorageClient
+from core.ai_parser import AnalizadorCV
+from core.data_mapper import DataMapper
+
+load_dotenv()
+
+MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
+POLLING_INTERVAL = 10 
+TEMP_FOLDER = "temp_downloads"
+
+if not os.path.exists(TEMP_FOLDER):
+    os.makedirs(TEMP_FOLDER)
+
+class HarvesterRelational:
+    def __init__(self):
+        self.notion = NotionClient()
+        self.supa_manager = SupabaseManager()
+        self.storage = StorageClient()
+        self.ai = AnalizadorCV()
+        
+        print("Resolviendo Data Source Madre (Talent Network)...")
+        self.main_ds_id = self.notion.get_data_source_id(MAIN_DB_ID) or MAIN_DB_ID
+
+    # --- UTILIDADES ---
+    def descargar_archivo_temporal(self, url, nombre):
+        clean_name = "".join([c for c in nombre if c.isalnum() or c in "._-"])
+        path = os.path.join(TEMP_FOLDER, clean_name)
+        try:
+            with requests.get(url, stream=True) as r:
+                r.raise_for_status()
+                with open(path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
+            return path
+        except: return None
+
+    def buscar_candidato_madre_completo(self, email, nombre):
+        """
+        Devuelve el objeto página completo de Notion si existe.
+        Necesario para leer el historial previo.
+        """
+        if email:
+            res = self.notion.query_data_source(self.main_ds_id, {"property": "Email", "email": {"equals": email}})
+            if res: return res[0]
+        
+        # Si no hay email o no se encuentra, buscamos por nombre
+        res = self.notion.query_data_source(self.main_ds_id, {"property": "Name", "title": {"equals": nombre}})
+        if res: return res[0]
+        
+        return None
+
+    def determinar_stage_inicial(self, ds_id):
+        schema = self.notion.get_database_schema(ds_id)
+        opciones = schema.get("Stage", {}).get("select", {}).get("options", [])
+        if not opciones: opciones = schema.get("Stage", {}).get("status", {}).get("options", [])
+        if not opciones: return None
+        mejor = None; menor = float('inf')
+        for op in opciones:
+            match = re.match(r"(\d+(\.\d+)?)", op["name"])
+            if match:
+                try: v = float(match.group(1)); (menor, mejor) = (v, op["name"]) if v < menor else (menor, mejor)
+                except: pass
+        return mejor if mejor else (opciones[0]["name"] if opciones else None)
+
+    def encontrar_propiedad_relacion(self, ds_id):
+        schema = self.notion.get_database_schema(ds_id)
+        for name, details in schema.items():
+            if details["type"] == "relation": return name
+        return "Candidate Relation"
+
+    def encontrar_propiedad_unique_id(self, ds_id):
+        schema = self.notion.get_database_schema(ds_id)
+        for name, details in schema.items():
+            if details["type"] == "unique_id": return name
+        return "ID"
+
+    def buscar_cv_en_auxiliar(self, aux_db_id, id_texto):
+        numeros = re.findall(r'\d+', str(id_texto))
+        if not numeros: return None, None
+        id_numerico = int(numeros[-1])
+
+        ds_aux = self.notion.get_data_source_id(aux_db_id)
+        if not ds_aux: return None, None
+        
+        col_id_name = self.encontrar_propiedad_unique_id(ds_aux)
+        filtro = {"property": col_id_name, "unique_id": {"equals": id_numerico}}
+        
+        res = self.notion.query_data_source(ds_aux, filtro)
+        if not res: return None, None
+        
+        files = res[0]["properties"].get("CV", {}).get("files", [])
+        if not files: return None, None
+        
+        return files[0]["file"]["url"], files[0]["name"]
+
+    # --- LÓGICA PRINCIPAL ---
+    def procesar_candidato(self, cand, process_entry, relation_col_name, stage_inicial):
+        page_id = cand["id"]
+        props = cand["properties"]
+        wf_db_id = process_entry["notion_workflow_id"]
+        aux_db_id = process_entry["notion_form_id"]
+        
+        # 1. Obtener ID Puente
+        id_text_list = props.get("ID", {}).get("rich_text", [])
+        id_text = id_text_list[0]["plain_text"] if id_text_list else ""
+        print(f"   Procesando ID Enlace: {id_text}...")
+
+        # 2. Descargar CV
+        notion_url, file_name = self.buscar_cv_en_auxiliar(aux_db_id, id_text)
+        if not notion_url:
+            print(f"      [AVISO] No se encontró CV en Auxiliar. Esperando sincronización...")
+            return
+
+        local_path = self.descargar_archivo_temporal(notion_url, file_name)
+        if not local_path: return
+
+        # 3. Subir a Supabase Storage
+        public_url = self.storage.subir_cv_desde_url(notion_url, file_name)
+        if not public_url: return
+
+        # 4. Análisis IA
+        datos_ia = self.ai.procesar_cv(local_path)
+        try: os.remove(local_path)
+        except: pass
+        
+        if not datos_ia: 
+            print("      [ERROR IA] Fallo lectura.")
+            return
+
+        # --- 5. NOTION MAIN DB: GESTIÓN DE HISTORIAL (CORREGIDO) ---
+        
+        # A. Buscamos si el candidato ya existe para LEER su historial actual
+        candidato_existente = self.buscar_candidato_madre_completo(datos_ia.get("email"), datos_ia["name"])
+        
+        historial_previo = []
+        id_madre_notion = None
+
+        if candidato_existente:
+            id_madre_notion = candidato_existente["id"]
+            # Extraemos la lista 'Process History' actual
+            raw_history = candidato_existente["properties"].get("Process History", {}).get("multi_select", [])
+            historial_previo = [tag["name"] for tag in raw_history]
+            print(f"      Historial previo detectado: {historial_previo}")
+
+        # B. Generamos el payload para Notion pasándole el historial previo
+        # DataMapper se encargará de añadir el proceso actual a esa lista
+        props_madre = DataMapper.map_to_notion(
+            datos_ia, 
+            public_url, 
+            process_entry["process_name"],
+            existing_history=historial_previo  # <--- CLAVE DEL ARREGLO
+        )
+        
+        error_madre = False
+        if not id_madre_notion:
+            print(f"      Creando en Talent Network Notion: {datos_ia['name']}...")
+            res_create = self.notion.create_page_in_db(MAIN_DB_ID, props_madre)
+            if res_create.status_code == 200: 
+                id_madre_notion = res_create.json()["id"]
+            else: 
+                print(f"      [ERROR NOTION] {res_create.status_code}")
+                error_madre = True
+        else:
+            print("      Actualizando en Talent Network Notion (preservando historial)...")
+            self.notion.update_page(id_madre_notion, props_madre)
+
+        # 6. SUPABASE: GESTION DE CANDIDATO Y APLICACION
+        # Paso A: Upsert Candidato (usando ID de Notion como ancla)
+        datos_candidato = DataMapper.map_to_supabase_candidate(datos_ia, public_url)
+        uuid_candidato = None
+        
+        # Solo guardamos en Supabase si tenemos un ID de Notion válido (ancla)
+        if id_madre_notion:
+            uuid_candidato = self.supa_manager.gestion_candidato(datos_candidato, id_madre_notion)
+
+        # Paso B: Upsert Aplicación
+        if uuid_candidato:
+            self.supa_manager.crear_aplicacion(
+                uuid_candidato, 
+                wf_db_id, 
+                page_id, 
+                stage_inicial
+            )
+
+        # 7. UPDATE FINAL WORKFLOW
+        update_props = {
+            "Processed": {"checkbox": True},
+            "Name": {"title": [{"text": {"content": datos_ia["name"]}}]},
+            "CV": {"files": [{"name": "CV.pdf", "external": {"url": public_url}}]}
+        }
+        
+        if id_madre_notion and not error_madre:
+            update_props[relation_col_name] = {"relation": [{"id": id_madre_notion}]}
+        else:
+            update_props["Name"] = {"title": [{"text": {"content": f"[ERROR SYNC] {datos_ia['name']}"}}]}
+
+        if stage_inicial:
+            update_props["Stage"] = {"select": {"name": stage_inicial}}
+
+        self.notion.update_page(page_id, update_props)
+        print("      [OK] Procesado y Sincronizado.")
+
+    def run(self):
+        print("--- HARVESTER V16 ---")
+        try:
+            while True:
+                procesos = self.supa_manager.obtener_procesos_activos()
+                for proc in procesos:
+                    wf_db_id = proc["notion_workflow_id"]
+                    ds_wf = self.notion.get_data_source_id(wf_db_id)
+                    if not ds_wf: continue
+
+                    rel_col = self.encontrar_propiedad_relacion(ds_wf)
+                    filtro = {
+                        "and": [
+                            {"property": "Processed", "checkbox": {"equals": False}},
+                            {"property": "ID", "rich_text": {"is_not_empty": True}}
+                        ]
+                    }
+                    candidatos = self.notion.query_data_source(ds_wf, filtro)
+                    
+                    if candidatos:
+                        print(f"--> Procesando {len(candidatos)} en '{proc['process_name']}'")
+                        stage_init = self.determinar_stage_inicial(ds_wf)
+                        for cand in candidatos:
+                            self.procesar_candidato(cand, proc, rel_col, stage_init)
+                time.sleep(POLLING_INTERVAL)
+        except KeyboardInterrupt: print("Bye.")
+
+if __name__ == "__main__":
+    HarvesterRelational().run()
+
+============================================================
+RUTA: .\scripts\observer.py
+============================================================
+import sys
+import os
+import time
+import json
+import hashlib
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.notion_client import NotionClient
+from core.supabase_client import SupabaseManager
+from core.data_mapper import DataMapper
+
+load_dotenv()
+
+POLLING_INTERVAL = 3  # Más rápido para captar ráfagas
+MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
+PROCESS_DASHBOARD_DB_ID = os.getenv("NOTION_PROCESS_DASHBOARD_DB_ID")
+
+class Observer:
+    def __init__(self):
+        self.notion = NotionClient()
+        self.supa = SupabaseManager()
+        
+        self.main_ds_id = self.notion.get_data_source_id(MAIN_DB_ID) or MAIN_DB_ID
+        self.dashboard_ds_id = self.notion.get_data_source_id(PROCESS_DASHBOARD_DB_ID) or PROCESS_DASHBOARD_DB_ID
+
+        # MEMORIA CACHÉ DE CONTENIDO (NO DE TIEMPO)
+        # Clave: Page ID -> Valor: Hash MD5 del contenido
+        self.content_cache = {}
+
+    def get_search_window(self):
+        """Ventana solapada de 3 minutos para vencer el lag de Notion."""
+        now = datetime.now(timezone.utc)
+        start_time = now - timedelta(minutes=3)
+        return start_time.isoformat()
+
+    def obtener_cambios_notion(self, ds_id):
+        iso_time = self.get_search_window()
+        filtro = {
+            "timestamp": "last_edited_time",
+            "last_edited_time": {"after": iso_time}
+        }
+        return self.notion.query_data_source(ds_id, filtro)
+
+    def calcular_hash(self, data_dict):
+        """Genera una firma única para un diccionario de datos."""
+        # Ordenamos las claves para que el hash sea determinista
+        s = json.dumps(data_dict, sort_keys=True, default=str)
+        return hashlib.md5(s.encode('utf-8')).hexdigest()
+
+    def ha_cambiado_el_contenido(self, page_id, data_dict):
+        """
+        Compara el contenido actual con el último procesado.
+        Devuelve True si hay cambios reales en los datos.
+        """
+        nuevo_hash = self.calcular_hash(data_dict)
+        ultimo_hash = self.content_cache.get(page_id)
+        
+        if nuevo_hash != ultimo_hash:
+            self.content_cache[page_id] = nuevo_hash
+            return True
+        return False
+
+    # --- VIGILANCIA 1: WORKFLOWS ---
+    def vigilar_workflows(self):
+        procesos = self.supa.obtener_procesos_activos()
+        if not procesos: return
+
+        for proc in procesos:
+            wf_db_id = proc["notion_workflow_id"]
+            ds_id = self.notion.get_data_source_id(wf_db_id)
+            if not ds_id: continue
+
+            # Traemos todo lo reciente
+            paginas = self.obtener_cambios_notion(ds_id)
+            for p in paginas:
+                self.procesar_cambio_stage(p)
+
+    def procesar_cambio_stage(self, page):
+        page_id = page["id"]
+        props = page["properties"]
+        
+        # Extraemos el dato relevante (Stage)
+        current_stage = None
+        stage_prop = props.get("Stage", {})
+        if stage_prop.get("type") == "select" and stage_prop.get("select"):
+            current_stage = stage_prop["select"]["name"]
+        
+        if not current_stage: return
+
+        # Chequeo de Hash para evitar llamadas a Supabase si no ha cambiado el stage visualmente
+        # (Aunque aquí usamos el hash para filtrar el spam de la ventana de 3 min)
+        data_relevante = {"stage": current_stage}
+        
+        if not self.ha_cambiado_el_contenido(page_id, data_relevante):
+            return # Ya procesamos este estado exacto en este ciclo de vida
+
+        # Lógica de negocio (Consultar Supabase para ver si es un cambio histórico real)
+        app_record = self.supa.obtener_aplicacion_por_notion_id(page_id)
+        if not app_record: return
+
+        if app_record["current_stage"] != current_stage:
+            print(f"   [WORKFLOW] Stage change: {app_record['current_stage']} -> {current_stage}")
+            self.supa.registrar_cambio_stage(app_record["id"], app_record["current_stage"], current_stage)
+
+    # --- VIGILANCIA 2: MAIN DB (AQUI ESTABA EL PROBLEMA) ---
+    def vigilar_main_db(self):
+        if not self.main_ds_id: return
+
+        # 1. Traemos todo lo que Notion dice que es "reciente" (ventana 3 min)
+        paginas = self.obtener_cambios_notion(self.main_ds_id)
+        
+        for p in paginas:
+            self.sincronizar_perfil(p)
+
+    def sincronizar_perfil(self, page):
+        page_id = page["id"]
+        props = page["properties"]
+        
+        # 2. Extraemos los datos LIMPIOS usando tu DataMapper arreglado
+        data_update = DataMapper.map_notion_to_supabase_update(props)
+        
+        # 3. FILTRO MAESTRO: ¿Ha cambiado el contenido real?
+        # Comparamos el hash de 'data_update' con lo que teníamos en memoria.
+        # Si cambiaste "Spain" por "Italy" -> El hash cambia -> TRUE.
+        # Si el timestamp cambió pero los datos son iguales -> El hash es igual -> FALSE.
+        if not self.ha_cambiado_el_contenido(page_id, data_update):
+            return 
+
+        name = data_update.get("name", "Desconocido")
+        print(f"   [MAIN DB] Cambio detectado en: {name}")
+        
+        # 4. Upsert
+        self.supa.gestion_candidato(data_update, page_id)
+
+    # --- VIGILANCIA 3: DASHBOARD ---
+    def vigilar_dashboard(self):
+        if not self.dashboard_ds_id: return
+        paginas = self.obtener_cambios_notion(self.dashboard_ds_id)
+        
+        for p in paginas:
+            self.sincronizar_estado_proceso(p)
+
+    def sincronizar_estado_proceso(self, page):
+        page_id = page["id"]
+        props = page["properties"]
+        
+        try:
+            name = props.get("Name", {}).get("title", [])[0]["plain_text"]
+            status_prop = props.get("Open/Closed", {}).get("select") or props.get("Status", {}).get("status")
+            new_status = status_prop["name"] if status_prop else None
+        except: return
+
+        if not new_status: return
+        
+        data_relevante = {"status": new_status, "name": name}
+        if not self.ha_cambiado_el_contenido(page_id, data_relevante):
+            return
+
+        print(f"   [DASHBOARD] Estado proceso '{name}' -> {new_status}")
+        self.supa.actualizar_estado_proceso_por_nombre(name, new_status)
+
+    def run(self):
+        print("\n--- OBSERVER V7 ---")
+        print(f"Polling: {POLLING_INTERVAL}s. Estrategia: Integridad de Contenido.")
+        
+        try:
+            while True:
+                try: self.vigilar_workflows()
+                except Exception as e: print(f"[ERR WORKFLOWS] {e}")
+
+                try: self.vigilar_main_db()
+                except Exception as e: print(f"[ERR MAIN DB] {e}")
+
+                try: self.vigilar_dashboard()
+                except Exception as e: print(f"[ERR DASHBOARD] {e}")
+                
+                print(".", end="", flush=True)
+                time.sleep(POLLING_INTERVAL)
+                
+        except KeyboardInterrupt:
+            print("\nObserver detenido.")
+
+if __name__ == "__main__":
+    Observer().run()
+

@@ -1,0 +1,18 @@
+# Archivos de entorno y secretos (¡CRÍTICO!)
+.env
+
+# Archivos temporales de Python
+__pycache__/
+*.py[cod]
+
+# Carpetas de entorno virtual
+venv/
+env/
+.venv/
+
+# Carpetas temporales de tu script (para que no se suban los PDFs)
+temp_downloads/
+
+# Archivos de sistema/editor
+.DS_Store
+.vscode/
