@@ -1,11 +1,13 @@
 import os
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from core.logger import get_logger # <--- Integración de Logger
 
 load_dotenv()
 
 class SupabaseManager:
     def __init__(self):
+        self.logger = get_logger("SupabaseManager") # <--- Logger
         url = os.getenv("SUPABASE_URL")
         key = os.getenv("SUPABASE_KEY")
         if not url or not key:
@@ -23,10 +25,10 @@ class SupabaseManager:
         }
         try:
             self.client.table("processes").insert(data).execute()
-            print(f"   [SUPABASE] Proceso registrado: {nombre}")
+            self.logger.info(f"Proceso registrado: {nombre}")
             return True
         except Exception as e:
-            print(f"   [SUPABASE ERROR] Fallo al registrar proceso: {e}")
+            self.logger.error(f"Fallo al registrar proceso: {e}")
             return False
 
     def obtener_procesos_activos(self):
@@ -34,10 +36,9 @@ class SupabaseManager:
             response = self.client.table("processes").select("*").eq("status", "Open").execute()
             return response.data
         except Exception as e:
-            print(f"   [SUPABASE ERROR] Error leyendo procesos activos: {e}")
+            self.logger.error(f"Error leyendo procesos activos: {e}")
             return []
 
-    # --- NUEVO MÉTODO QUE FALTABA ---
     def actualizar_estado_proceso_por_nombre(self, nombre, nuevo_estado):
         """Actualiza el status (Open/Closed) basado en el nombre del proceso."""
         try:
@@ -47,7 +48,7 @@ class SupabaseManager:
             }).eq("process_name", nombre).execute()
             return True
         except Exception as e:
-            print(f"      [SUPABASE ERROR] Fallo actualizando proceso: {e}")
+            self.logger.error(f"Fallo actualizando proceso: {e}")
             return False
 
     # --- GESTIÓN DE CANDIDATOS (IDENTITY ENGINE) ---
@@ -88,7 +89,7 @@ class SupabaseManager:
                 return None
 
         except Exception as e:
-            print(f"      [SUPABASE ERROR] Fallo gestión candidato: {e}")
+            self.logger.error(f"Fallo gestión candidato: {e}", exc_info=True)
             return None
 
     # --- GESTIÓN DE APLICACIONES ---
@@ -110,7 +111,7 @@ class SupabaseManager:
             ).execute()
             return True
         except Exception as e:
-            print(f"      [SUPABASE ERROR] Fallo creando aplicación: {e}")
+            self.logger.error(f"Fallo creando aplicación: {e}")
             return False
 
     # --- OBSERVER METHODS ---
@@ -133,8 +134,52 @@ class SupabaseManager:
                 "from_stage": old_stage,
                 "to_stage": new_stage
             }).execute()
-            print(f"      [ANALYTICS] Movimiento registrado: {old_stage} -> {new_stage}")
+            self.logger.info(f"Movimiento registrado: {old_stage} -> {new_stage}")
             return True
         except Exception as e:
-            print(f"      [OBSERVER ERROR] {e}")
+            self.logger.error(f"Error registrando cambio de stage: {e}")
             return False
+
+    # --- MÉTODOS REFACTORIZADOS ---
+
+    def get_candidate_id_by_email(self, email):
+        """
+        Busca el UUID del candidato por su email.
+        Incluye limpieza de espacios (strip) para seguridad.
+        """
+        if not email: return None
+        try:
+            email_clean = email.strip()
+            res = self.client.table("Nzyme_Talent_Network").select("id").eq("email", email_clean).execute()
+            if res.data: return res.data[0]['id']
+            return None
+        except Exception: 
+            return None
+
+    # El método 'get_candidate_id_smart' ha sido eliminado por redundancia.
+
+    def upsert_reference(self, ref_data):
+        """Crea o actualiza una referencia en SQL."""
+        try:
+            # 1. Intentamos buscar si ya existe (para hacer update)
+            existing = None
+            
+            # A. Buscamos por ID Maestro (Input original)
+            if ref_data.get("master_notion_id"):
+                existing = self.client.table("candidate_references").select("id").eq("master_notion_id", ref_data["master_notion_id"]).execute()
+            
+            # B. Si no, buscamos por ID Hijo (Update del reclutador)
+            if not (existing and existing.data) and ref_data.get("child_notion_id"):
+                existing = self.client.table("candidate_references").select("id").eq("child_notion_id", ref_data["child_notion_id"]).execute()
+
+            if existing and existing.data:
+                # UPDATE
+                rid = existing.data[0]['id']
+                self.client.table("candidate_references").update(ref_data).eq("id", rid).execute()
+                self.logger.info(f"Referencia actualizada (ID: {rid})")
+            else:
+                # INSERT
+                self.client.table("candidate_references").insert(ref_data).execute()
+                self.logger.info("Referencia nueva creada.")
+        except Exception as e:
+            self.logger.error(f"Error gestionando referencia: {e}")

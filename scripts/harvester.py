@@ -12,7 +12,10 @@ from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
 from core.storage_client import StorageClient
 from core.ai_parser import AnalizadorCV
-from core.data_mapper import DataMapper
+from core.notion_builder import NotionBuilder
+from core.domain_mapper import DomainMapper
+from core.constants import PROP_CHECKBOX_PROCESSED, PROP_ID, PROP_NAME, PROP_CV_FILES, PROP_STAGE
+from core.logger import get_logger
 
 load_dotenv()
 
@@ -24,13 +27,14 @@ if not os.path.exists(TEMP_FOLDER):
     os.makedirs(TEMP_FOLDER)
 
 class HarvesterRelational:
-    def __init__(self):
-        self.notion = NotionClient()
-        self.supa_manager = SupabaseManager()
-        self.storage = StorageClient()
-        self.ai = AnalizadorCV()
+    def __init__(self, notion_client, supa_client, storage_client, ai_analyzer):
+        self.logger = get_logger("Harvester")
+        self.notion = notion_client
+        self.supa_manager = supa_client
+        self.storage = storage_client
+        self.ai = ai_analyzer
         
-        print("Resolviendo Data Source Madre (Talent Network)...")
+        self.logger.info("Resolviendo Data Source Madre (Talent Network)...")
         self.main_ds_id = self.notion.get_data_source_id(MAIN_DB_ID) or MAIN_DB_ID
 
     # --- UTILIDADES ---
@@ -71,7 +75,7 @@ class HarvesterRelational:
                 return candidate_page # Match (Emails coinciden)
                 
             # Si nombres coinciden pero emails son distintos -> SON DISTINTOS
-            print(f"      [INFO] Homónimo detectado: '{nombre}' existe con otro email. Creando nuevo.")
+            self.logger.info(f"Homónimo detectado: '{nombre}' existe con otro email. Creando nuevo.")
             return None
         
         return None
@@ -123,15 +127,16 @@ class HarvesterRelational:
         
         # Extracción de datos del proceso
         process_name_actual = process_entry["process_name"]
-        process_type_actual = process_entry.get("process_type") # NUEVO: Tipo de proceso (ej: Investment - VP)
+        process_type_actual = process_entry.get("process_type") 
         
-        id_text = props.get("ID", {}).get("rich_text", [])[0]["plain_text"] if props.get("ID", {}).get("rich_text", []) else ""
-        print(f"   Procesando ID Enlace: {id_text}...")
+        # Usamos constante PROP_ID
+        id_text = props.get(PROP_ID, {}).get("rich_text", [])[0]["plain_text"] if props.get(PROP_ID, {}).get("rich_text", []) else ""
+        self.logger.info(f"Procesando ID Enlace: {id_text}...")
 
         # 1. Obtener CV
         notion_url, file_name = self.buscar_cv_en_auxiliar(aux_db_id, id_text)
         if not notion_url:
-            print(f"      [AVISO] CV no encontrado. Esperando...")
+            self.logger.warning("CV no encontrado. Esperando...")
             return
 
         local_path = self.descargar_archivo_temporal(notion_url, file_name)
@@ -142,6 +147,7 @@ class HarvesterRelational:
         if not public_url: return
 
         # 3. Analizar con IA
+        self.logger.info("Analizando con IA...")
         datos_ia = self.ai.procesar_cv(local_path)
         try: os.remove(local_path)
         except: pass
@@ -151,55 +157,53 @@ class HarvesterRelational:
         candidato_existente = self.buscar_candidato_smart(datos_ia.get("email"), datos_ia["name"])
         
         historial_previo = []
-        team_role_previo = [] # Para la nueva columna fusionada
+        team_role_previo = []
         id_madre_notion = None
 
         if candidato_existente:
             id_madre_notion = candidato_existente["id"]
             
-            # A. Extraer Historial de Procesos
             raw_history = candidato_existente["properties"].get("Process History", {}).get("multi_select", [])
             historial_previo = [tag["name"] for tag in raw_history]
             
-            # B. Extraer 'Proposed Nzyme Team & Role' existente (NUEVO)
-            # Esto evita que borremos lo que se puso en un referral previo
             raw_team_role = candidato_existente["properties"].get("Proposed Nzyme Team & Role", {}).get("multi_select", [])
             team_role_previo = [tag["name"] for tag in raw_team_role]
             
-            print(f"      Historial recuperado: {len(historial_previo)} procesos.")
+            self.logger.info(f"Historial recuperado: {len(historial_previo)} procesos.")
 
-        # C. Generar Payload (DataMapper fusiona los datos)
-        props_madre = DataMapper.map_to_notion(
+        # C. Generar Payload
+        props_madre = NotionBuilder.build_candidate_payload(
             datos_ia, 
             public_url, 
             process_name_actual, 
             existing_history=historial_previo,
-            process_type=process_type_actual,   # Pasamos el tipo del proceso actual
-            existing_team_role=team_role_previo # Pasamos lo que ya tenía
+            process_type=process_type_actual,   
+            existing_team_role=team_role_previo 
         )
         
         # D. Ejecución en Notion
         error_madre = False
         if not id_madre_notion:
-            print(f"      Creando candidato: {datos_ia['name']}")
-            res_create = self.notion.create_page_in_db(MAIN_DB_ID, props_madre)
+            self.logger.info(f"Creando candidato: {datos_ia['name']}")
+            # FIX APLICADO: MAIN_DB_ID en vez de self.main_ds_id
+            res_create = self.notion.create_page_in_db(MAIN_DB_ID, props_madre) 
             if res_create.status_code == 200: 
                 id_madre_notion = res_create.json()["id"]
             else: 
-                print(f"      [ERROR NOTION CREATE] {res_create.status_code}: {res_create.text}")
+                self.logger.error(f"[ERROR NOTION CREATE] {res_create.status_code}: {res_create.text}")
                 error_madre = True
                 return 
         else:
-            print(f"      Actualizando candidato: {datos_ia['name']}")
+            self.logger.info(f"Actualizando candidato: {datos_ia['name']}")
             res_update = self.notion.update_page(id_madre_notion, props_madre)
             if res_update.status_code != 200:
-                print(f"      [ERROR NOTION UPDATE] {res_update.status_code}: {res_update.text}")
+                self.logger.error(f"[ERROR NOTION UPDATE] {res_update.status_code}: {res_update.text}")
                 error_madre = True
                 return 
 
         # 5. SUPABASE SYNC
         if not error_madre:
-            datos_candidato = DataMapper.map_to_supabase_candidate(datos_ia, public_url)
+            datos_candidato = DomainMapper.map_to_supabase_candidate(datos_ia, public_url)
             uuid_candidato = self.supa_manager.gestion_candidato(datos_candidato, id_madre_notion)
 
             if uuid_candidato:
@@ -210,22 +214,22 @@ class HarvesterRelational:
                     stage_inicial
                 )
 
-        # 6. CIERRE
+        # 6. CIERRE USANDO CONSTANTES
         update_props = {
-            "Processed": {"checkbox": True},
-            "Name": {"title": [{"text": {"content": datos_ia["name"]}}]},
-            "CV": {"files": [{"name": "CV.pdf", "external": {"url": public_url}}]}
+            PROP_CHECKBOX_PROCESSED: {"checkbox": True},
+            PROP_NAME: {"title": [{"text": {"content": datos_ia["name"]}}]},
+            PROP_CV_FILES: {"files": [{"name": "CV.pdf", "external": {"url": public_url}}]}
         }
         if id_madre_notion:
             update_props[relation_col_name] = {"relation": [{"id": id_madre_notion}]}
         if stage_inicial:
-            update_props["Stage"] = {"select": {"name": stage_inicial}}
+            update_props[PROP_STAGE] = {"select": {"name": stage_inicial}}
 
         self.notion.update_page(page_id, update_props)
-        print("      [OK] Finalizado.")
+        self.logger.info("[OK] Finalizado.")
 
     def run(self):
-        print("--- HARVESTER V20 (TEAM & ROLE FUSION) ---")
+        self.logger.info("--- HARVESTER ---")
         try:
             while True:
                 procesos = self.supa_manager.obtener_procesos_activos()
@@ -235,21 +239,35 @@ class HarvesterRelational:
                     if not ds_wf: continue
 
                     rel_col = self.encontrar_propiedad_relacion(ds_wf)
+                    
+                    # FILTRO USANDO CONSTANTES
                     filtro = {
                         "and": [
-                            {"property": "Processed", "checkbox": {"equals": False}},
-                            {"property": "ID", "rich_text": {"is_not_empty": True}}
+                            {"property": PROP_CHECKBOX_PROCESSED, "checkbox": {"equals": False}},
+                            {"property": PROP_ID, "rich_text": {"is_not_empty": True}}
                         ]
                     }
                     candidatos = self.notion.query_data_source(ds_wf, filtro)
                     
                     if candidatos:
-                        print(f"--> Detectados {len(candidatos)} en '{proc['process_name']}'")
+                        self.logger.info(f"--> Detectados {len(candidatos)} en '{proc['process_name']}'")
                         stage_init = self.determinar_stage_inicial(ds_wf)
                         for cand in candidatos:
                             self.procesar_candidato(cand, proc, rel_col, stage_init)
                 time.sleep(POLLING_INTERVAL)
-        except KeyboardInterrupt: print("Bye.")
+        except KeyboardInterrupt: self.logger.info("Bye.")
 
 if __name__ == "__main__":
-    HarvesterRelational().run()
+    client_notion = NotionClient()
+    client_supa = SupabaseManager()
+    client_storage = StorageClient()
+    analyzer_ai = AnalizadorCV()
+
+    bot = HarvesterRelational(
+        notion_client=client_notion,
+        supa_client=client_supa,
+        storage_client=client_storage,
+        ai_analyzer=analyzer_ai
+    )
+    
+    bot.run()

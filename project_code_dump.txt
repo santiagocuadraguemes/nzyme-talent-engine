@@ -17,6 +17,8 @@ NOTION_MAIN_DB_ID=******
 NOTION_PROCESS_DASHBOARD_DB_ID=******
 # Guidelines > Reference Materials > Role Templates & Documentation
 NOTION_GUIDELINES_DB_ID=******
+# Notion Master Reference DB
+NOTION_MASTER_REF_DB_ID=******
 
 ============================================================
 RUTA: .\requirements.txt
@@ -159,10 +161,12 @@ class DataMapper:
         "10-15 Years", "15+ Years", "No"
     }
 
-    # --- HELPERS DE LECTURA (Notion -> Python) ---
+    # =========================================================================
+    #  A. HELPERS DE LECTURA
+    # =========================================================================
+
     @staticmethod
     def _extract_tags(prop_data):
-        """Extrae etiquetas tanto de Multi-Select como de Select."""
         if not prop_data: return []
         if "multi_select" in prop_data:
             return [item["name"] for item in prop_data["multi_select"]]
@@ -172,7 +176,6 @@ class DataMapper:
 
     @staticmethod
     def _extract_text(prop_data):
-        """Extrae texto plano de RichText o Title."""
         if not prop_data: return None
         if "rich_text" in prop_data:
             parts = prop_data["rich_text"]
@@ -203,7 +206,10 @@ class DataMapper:
             "has_experience": len(companies) > 0
         }
 
-    # --- HELPERS DE ESCRITURA (Python -> Notion) ---
+    # =========================================================================
+    #  B. HELPERS DE ESCRITURA (Todo default)
+    # =========================================================================
+
     @staticmethod
     def _get_years_range_tag(years_float):
         y = years_float
@@ -218,43 +224,50 @@ class DataMapper:
     @staticmethod
     def _format_multi_select(items_list):
         if not items_list: return []
-        return [{"name": str(i)[:100].strip().replace(",", "")} for i in items_list]
+        return [{"name": str(i)[:100].strip().replace(",", ""), "color": "default"} for i in items_list]
 
     @staticmethod
     def _create_experience_tags(sector_data):
         tags = []
         if not sector_data or not sector_data.get("has_experience"):
-            return [{"name": "No"}]
-
+            return [{"name": "No", "color": "default"}]
         companies = sector_data.get("companies", [])
         for c in companies:
-            if c: tags.append({"name": str(c)[:100].strip().replace(",", "")})
-            
+            if c: tags.append({"name": str(c)[:100].strip().replace(",", ""), "color": "default"})
         years = sector_data.get("years", 0)
         range_tag = DataMapper._get_years_range_tag(years)
-        if range_tag:
-            tags.append({"name": range_tag})
-            
-        if not tags: return [{"name": "No"}]
+        if range_tag: tags.append({"name": range_tag, "color": "default"})
+        if not tags: return [{"name": "No", "color": "default"}]
         return tags
 
-    # --- MAPEO PRINCIPAL: AI -> NOTION (Usado por Harvester) ---
+    # =========================================================================
+    #  C. MAPEO A NOTION (Harvester / Observer Enricher)
+    # =========================================================================
+
     @staticmethod
-    def map_to_notion(candidate_data, public_cv_url, process_name, existing_history=None):
+    def map_to_notion(candidate_data, public_cv_url, process_name, existing_history=None, process_type=None, existing_team_role=None):
         """
-        Construye el payload para crear/actualizar una página en Notion.
-        existing_history: Lista de strings con los procesos anteriores (si existen).
+        Construye el payload para Notion.
+        - existing_history: Lista para 'Process History'.
+        - process_type: String con el tipo de proceso actual (ej: "Investment - Associate").
+        - existing_team_role: Lista actual de 'Proposed Nzyme Team & Role'.
         """
         exp = candidate_data.get("experience", {})
         edu = candidate_data.get("education", {})
         gen = candidate_data.get("general", {})
         
-        # 1. Gestión del Historial de Procesos
+        # 1. Gestión de Historial de Procesos
         history_list = existing_history if existing_history else []
-        if process_name not in history_list:
+        if process_name and process_name not in history_list:
             history_list.append(process_name)
-        
-        history_tags = [{"name": p} for p in history_list[-100:]]
+        history_tags = [{"name": p, "color": "default"} for p in history_list[-100:]]
+
+        # 2. Gestión de Proposed Nzyme Team & Role (NUEVO REQUISITO)
+        team_role_list = existing_team_role if existing_team_role else []
+        # Si venimos de un proceso (Harvester) y hay un tipo de proceso, lo añadimos
+        if process_type and process_type not in team_role_list:
+            team_role_list.append(process_type)
+        team_role_tags = [{"name": t, "color": "default"} for t in team_role_list]
 
         props = {
             "Name": {"title": [{"text": {"content": candidate_data["name"][:200]}}]},
@@ -262,17 +275,25 @@ class DataMapper:
             "LinkedIn": {"url": candidate_data.get("linkedin_url")},
             "CV": {"files": [{"name": "CV.pdf", "external": {"url": public_cv_url}}]},
             "Date Added": {"date": {"start": date.today().isoformat()}},
-            "Last Process Involved in": {"select": {"name": process_name}},
-            "Process History": {"multi_select": history_tags}
+            
+            # Columnas de Proceso y Equipo
+            "Last Process Involved in": {"select": {"name": process_name, "color": "default"}} if process_name else None,
+            "Process History": {"multi_select": history_tags},
+            "Proposed Nzyme Team & Role": {"multi_select": team_role_tags} # <--- NUEVA COLUMNA
         }
         
+        # Limpieza de None (si process_name es None, no enviamos Last Process para no borrarlo si no queremos)
+        if not props["Last Process Involved in"]:
+            del props["Last Process Involved in"]
+
         if candidate_data.get("email"):
             props["Email"] = {"email": candidate_data.get("email")}
 
         rango_total = DataMapper._get_years_range_tag(candidate_data.get("total_years", 0))
         if rango_total:
-            props["EXPERIENCE: Total Years"] = {"select": {"name": rango_total}}
+            props["EXPERIENCE: Total Years"] = {"select": {"name": rango_total, "color": "default"}}
 
+        # Mapeo de Sectores
         sector_mapping = {
             "EXPERIENCE: Consulting": exp.get("consulting"),
             "EXPERIENCE: Audit": exp.get("audit"),
@@ -290,20 +311,25 @@ class DataMapper:
         for prop_name, data in sector_mapping.items():
             props[prop_name] = {"multi_select": DataMapper._create_experience_tags(data)}
 
+        # Listas Simples
         props["EXPERIENCE: International"] = {"multi_select": DataMapper._format_multi_select(gen.get("international_locations"))}
         props["EXPERIENCE: Industries"] = {"multi_select": DataMapper._format_multi_select(gen.get("industries_specialized"))}
         props["Languages"] = {"multi_select": DataMapper._format_multi_select(candidate_data.get("languages"))}
 
+        # Educación
         props["EDUCATION: Bachelors"] = {"multi_select": DataMapper._format_multi_select(edu.get("bachelors"))}
         props["EDUCATION: Masters"] = {"multi_select": DataMapper._format_multi_select(edu.get("masters"))}
         props["EDUCATION: University"] = {"multi_select": DataMapper._format_multi_select(edu.get("university"))}
         
         mba_val = edu.get("mba", "No")
-        props["EDUCATION: MBA"] = {"multi_select": [{"name": mba_val}]}
+        props["EDUCATION: MBA"] = {"multi_select": [{"name": mba_val, "color": "default"}]}
 
         return props
 
-    # --- MAPEO SUPABASE (Usado por Harvester) ---
+    # =========================================================================
+    #  D. MAPEO A SUPABASE (Harvester)
+    # =========================================================================
+
     @staticmethod
     def map_to_supabase_candidate(candidate_data, public_cv_url):
         return {
@@ -315,12 +341,14 @@ class DataMapper:
             "updated_at": "now()"
         }
 
-    # --- MAPEO INVERSO (Usado por Observer) ---
+    # =========================================================================
+    #  E. MAPEO INVERSO COMPLETO (Observer)
+    # =========================================================================
+
     @staticmethod
     def map_notion_to_supabase_update(notion_props):
         data = {}
         
-        # 1. Datos Clave
         raw_name = notion_props.get("Name", {}).get("title", [])
         if raw_name: data["name"] = raw_name[0]["plain_text"]
         
@@ -330,18 +358,29 @@ class DataMapper:
         linkedin = notion_props.get("LinkedIn", {}).get("url")
         data["linkedin_url"] = linkedin if linkedin else None
 
-        # 2. Campos Extra
+        # Extracción de URL de CV
+        cv_files = notion_props.get("CV", {}).get("files", [])
+        if cv_files:
+            archivo = cv_files[0]
+            if "external" in archivo:
+                data["cv_url"] = archivo["external"]["url"]
+            elif "file" in archivo:
+                data["cv_url"] = archivo["file"]["url"]
+        else:
+            data["cv_url"] = None
+
         extra_data = {
             "cultural_fit": DataMapper._extract_tags(notion_props.get("Cultural Fit")),
             "capabilities_assessment": DataMapper._extract_tags(notion_props.get("Capabilities Assessment")),
             "referred_by": DataMapper._extract_text(notion_props.get("Referred by/Sourced from...")),
             
-            # --- CORRECCIÓN CLAVE AQUÍ: LEER LAS NUEVAS COLUMNAS ---
             "last_process": DataMapper._extract_select_name(notion_props.get("Last Process Involved in")),
-            "process_history": DataMapper._extract_tags(notion_props.get("Process History"))
+            "process_history": DataMapper._extract_tags(notion_props.get("Process History")),
+            
+            # --- NUEVA COLUMNA FUSIONADA ---
+            "proposed_team_role": DataMapper._extract_tags(notion_props.get("Proposed Nzyme Team & Role"))
         }
 
-        # 3. Mapeo Inverso Experiencia
         exp_fields_map = {
             "EXPERIENCE: Consulting": "consulting",
             "EXPERIENCE: Audit": "audit",
@@ -363,10 +402,9 @@ class DataMapper:
             "total_years_range": DataMapper._extract_select_name(notion_props.get("EXPERIENCE: Total Years")),
             "languages": DataMapper._extract_tags(notion_props.get("Languages")),
             
-            # Guardamos los datos de proceso dentro de 'general' o en la raíz, donde prefieras.
-            # Los guardaré en la raíz del JSON para fácil acceso.
             "last_process": extra_data["last_process"],
             "process_history": extra_data["process_history"],
+            "proposed_team_role": extra_data["proposed_team_role"], # Guardado aquí
             
             "general": {
                 "international_locations": DataMapper._extract_tags(notion_props.get("EXPERIENCE: International")),
@@ -392,6 +430,18 @@ class DataMapper:
         data["updated_at"] = "now()"
         
         return data
+    
+    @staticmethod
+    def _extract_title(prop):
+        if not prop: return ""
+        return "".join([t["plain_text"] for t in prop.get("title", [])])
+
+    @staticmethod
+    def _extract_multiselect(prop):
+        """Devuelve los valores unidos por comas o el primero."""
+        if not prop or not prop.get("multi_select"): return None
+        # Unimos con comas para guardar en SQL texto plano
+        return ", ".join([opt["name"] for opt in prop["multi_select"]])
 
 ============================================================
 RUTA: .\core\guidelines_parser.py
@@ -415,6 +465,7 @@ class GuidelinesParser:
             self.guidelines_ds_id = self.notion.get_data_source_id(GUIDELINES_DB_ID) or GUIDELINES_DB_ID
 
     def buscar_documento_guidelines(self, process_type_string):
+        """Busca el documento de Interview Stages."""
         self._init_datasource()
         if not self.guidelines_ds_id: return None
         
@@ -445,6 +496,53 @@ class GuidelinesParser:
         
         resultados = self.notion.query_data_source(self.guidelines_ds_id, filtro_final)
         return resultados[0] if resultados else None
+
+    def buscar_documento_job_description(self, process_type_string):
+        """Busca el documento de Job Description."""
+        self._init_datasource()
+        if not self.guidelines_ds_id: return None
+        
+        partes = process_type_string.split(" - ")
+        if len(partes) < 2: return None
+            
+        prefijo = partes[0].strip()
+        rol = partes[1].strip()
+        
+        filtros = []
+        if prefijo == "PortCo":
+            filtros = [
+                {"property": "Company", "select": {"equals": "PortCo"}},
+                {"property": "Role", "select": {"equals": rol}}
+            ]
+        else:
+            filtros = [
+                {"property": "Company", "select": {"equals": "Nzyme"}},
+                {"property": "Team", "select": {"equals": prefijo}},
+                {"property": "Role", "select": {"equals": rol}}
+            ]
+
+        filtro_final = {
+            "and": [
+                {"property": "Document Type", "select": {"equals": "Job Description"}}
+            ] + filtros
+        }
+        
+        resultados = self.notion.query_data_source(self.guidelines_ds_id, filtro_final)
+        return resultados[0] if resultados else None
+
+    def extraer_contenido_pagina(self, page_id):
+        bloques = self.notion.get_page_blocks(page_id)
+        bloques_limpios = []
+        for b in bloques:
+            tipo = b["type"]
+            if tipo in ["child_page", "child_database"]: continue
+            nuevo_bloque = {
+                "object": "block",
+                "type": tipo,
+                tipo: b[tipo]
+            }
+            bloques_limpios.append(nuevo_bloque)
+        return bloques_limpios
 
     def buscar_candidate_template_id(self, parent_page_id):
         bloques = self.notion.get_page_blocks(parent_page_id)
@@ -478,15 +576,17 @@ class GuidelinesParser:
         nombres_usados = set()
         ultimo_numero_stage = "0"
         
+        # Buffer para guardar decisiones y soltarlas al final de la ronda
+        decisiones_pendientes = [] # clave: numero_ronda (str), valor: dict del stage
+
         # 1. Definimos los Fijos (Cierres)
-        # Como has borrado los del template, estos se crearán AL FINAL de la lista.
         stages_fijos = [
             {"name": "Offer", "color": "green"}, 
             {"name": "Hired", "color": "blue"}, 
-            {"name": "Rejected", "color": "red"},
+            {"name": "Discarded completely for Nzyme", "color": "yellow"},
+            {"name": "Disqualified only for this role", "color": "red"},
             {"name": "Lost", "color": "gray"}
         ]
-        # Creamos un set de nombres fijos para evitar que si alguien escribe "Offer" en la tabla, se duplique
         nombres_fijos = {s["name"] for s in stages_fijos}
 
         # 2. Leer Tabla (Dinámicos)
@@ -501,30 +601,79 @@ class GuidelinesParser:
                     col_num = self._limpiar_celda("".join([t["plain_text"] for t in cells[0]]))
                     col_name = self._limpiar_celda("".join([t["plain_text"] for t in cells[1]]))
                     
+                    # --- FILTROS DE EXCLUSIÓN ---
                     if "Interview Type" in col_name or "#" in col_num: continue
+                    if "Individual" in col_name: continue
 
                     nombre_final = None
                     color = "default"
-                    
+                    es_decision = False
+                    numero_ronda_actual = ultimo_numero_stage # Por defecto
+
                     if col_num and col_num[0].isdigit():
                         ultimo_numero_stage = col_num.split('.')[0]
+                        numero_ronda_actual = ultimo_numero_stage
                         nombre_final = f"{col_num} {col_name}"
                         color = self._determinar_color(col_num)
+                        
                     elif "Group Decision" in col_name or "Round" in col_name:
-                        nombre_final = f"{ultimo_numero_stage}. [ROUND DECISION]"
+                        nombre_final = f"{ultimo_numero_stage} [ROUND DECISION]"
                         color = self._determinar_color(ultimo_numero_stage)
+                        es_decision = True
+                        numero_ronda_actual = ultimo_numero_stage
 
-                    # Si el nombre es válido, no está repetido y NO es uno de los fijos...
                     if nombre_final and nombre_final not in nombres_usados and nombre_final not in nombres_fijos:
-                        nombre_final = nombre_final[:100]
-                        stages_dinamicos.append({"name": nombre_final, "color": color})
+                        stage_obj = {"name": nombre_final[:100], "color": color}
                         nombres_usados.add(nombre_final)
+                        
+                        if es_decision:
+                            # NO lo añadimos a la lista principal todavía. Lo guardamos.
+                            decisiones_pendientes.append({'ronda': numero_ronda_actual, 'stage': stage_obj})
+                        else:
+                            # Antes de añadir un stage normal (ej: 2.1), miramos si hay una decisión pendiente de la ronda ANTERIOR (1)
+                            # Si la hay, significa que hemos cambiado de ronda, así que soltamos la decisión pendiente.
+                            
+                            # Nota: Esto asume lectura secuencial. Si la tabla está ordenada, funciona.
+                            # Para mayor robustez, simplemente añadimos a la lista y reordenamos después, 
+                            # pero como pediste mantener lógica, haremos inserción directa.
+                            stages_dinamicos.append(stage_obj)
 
-        # 3. Construcción Final de la Lista
-        # Al estar la base de datos vacía, Notion respetará escrupulosamente este orden:
-        # [1. Screening, 2. Interview... , Offer, Hired, Rejected, Lost]
-        lista_final = stages_dinamicos + stages_fijos
+
+        # 3. Inserción Inteligente de Decisiones (Post-Procesado)
+        # Recorremos la lista creada e insertamos las decisiones al final de sus respectivos bloques.
+        lista_con_decisiones = []
         
+        # Agrupamos por ronda para facilitar la inserción al final
+        rondas = {} # "1": [stage1.1, stage1.2], "2": [stage2.1]...
+        orden_rondas = [] # ["1", "2"...] para mantener el orden de aparición
+        
+        for st in stages_dinamicos:
+            
+            # Extraemos el número de ronda del nombre (ej: "1.1 Entrevista" -> "1")
+            match = re.match(r"(\d+)", st["name"])
+            if match:
+                r_num = match.group(1)
+                if r_num not in rondas:
+                    rondas[r_num] = []
+                    orden_rondas.append(r_num)
+                rondas[r_num].append(st)
+            else:
+                # Si no tiene número (raro), lo metemos en una ronda "0" o genérica
+                if "0" not in rondas: 
+                    rondas["0"] = []
+                    orden_rondas.append("0")
+                rondas["0"].append(st)
+
+        # Reconstruimos la lista
+        for r_num in orden_rondas:
+            lista_con_decisiones.extend(rondas[r_num])
+            for dec in decisiones_pendientes:
+                if dec['ronda'] == r_num:
+                    lista_con_decisiones.append(dec['stage'])
+                    break  # 1 sola por ronda
+                
+        # 4. Construcción Final
+        lista_final = lista_con_decisiones + stages_fijos
         return lista_final
 
 ============================================================
@@ -564,6 +713,21 @@ class NotionClient:
         if response.status_code == 200:
             return response.json().get("results", [])
         return []
+
+    def append_block_children(self, block_id, children, after=None):
+        """
+        Añade bloques.
+        - Si 'after' es None: Añade al final.
+        - Si 'after' es un ID de bloque: Añade justo después de ese bloque.
+        """
+        url = f"{self.base_url}/blocks/{block_id}/children"
+        payload = {"children": children}
+        
+        if after:
+            payload["after"] = after
+        
+        response = requests.patch(url, headers=self.headers, json=payload)
+        return response
 
     def query_data_source(self, data_source_id, filter_params):
         """Consulta datos usando el Data Source ID."""
@@ -631,6 +795,47 @@ class NotionClient:
         response = requests.get(url, headers=self.headers)
         if response.status_code == 200: return response.json().get("properties", {})
         return {}
+
+    def search_recently_edited(self, since_iso_timestamp):
+        """
+        Busca páginas modificadas ordenadas por fecha.
+        Filtra en Python las que sean más recientes que el timestamp dado.
+        """
+        url = f"{self.base_url}/search"
+        
+        # Pedimos a Notion las últimas 100 páginas modificadas
+        payload = {
+            "filter": {"value": "page", "property": "object"},
+            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+            "page_size": 100
+        }
+        
+        response = requests.post(url, headers=self.headers, json=payload)
+        
+        if response.status_code == 200:
+            results = response.json().get("results", [])
+            filtered = []
+            # Filtramos nosotros manualmente
+            for page in results:
+                last_edited = page.get("last_edited_time")
+                # Comparación de cadenas ISO 8601 funciona correctamente
+                if last_edited and last_edited > since_iso_timestamp:
+                    filtered.append(page)
+            return filtered
+            
+        print(f"[API ERROR] Search failed ({response.status_code}): {response.text}")
+        return []
+
+    def find_child_database(self, parent_page_id, db_title_contains):
+        """Busca una base de datos hija dentro de una página."""
+        # Nota: get_page_blocks ya debe estar implementado
+        children = self.get_page_blocks(parent_page_id)
+        for block in children:
+            if block["type"] == "child_database":
+                title = block.get("child_database", {}).get("title", "").lower()
+                if db_title_contains.lower() in title:
+                    return block["id"]
+        return None
 
 ============================================================
 RUTA: .\core\storage_client.py
@@ -836,65 +1041,51 @@ class SupabaseManager:
             print(f"      [OBSERVER ERROR] {e}")
             return False
 
-============================================================
-RUTA: .\scripts\debug_schema.py
-============================================================
-import sys
-import os
-import json
-from dotenv import load_dotenv
+    def get_candidate_id_by_email(self, email):
+        """Busca el UUID del candidato por su email."""
+        try:
+            res = self.client.table("Nzyme_Talent_Network").select("id").eq("email", email).execute()
+            if res.data: return res.data[0]['id']
+            return None
+        except: return None
 
-# Añadimos la ruta raíz para importar core
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # Añadir dentro de la clase SupabaseManager:
 
-from core.notion_client import NotionClient
+    def get_candidate_id_smart(self, email):
+        """Busca ID de candidato priorizando Email."""
+        if not email: return None
+        # Limpiamos espacios por seguridad
+        email = email.strip()
+        res = self.client.table("Nzyme_Talent_Network").select("id").eq("email", email).execute()
+        if res.data: return res.data[0]['id']
+        return None
 
-load_dotenv()
+    def upsert_reference(self, ref_data):
+        """Crea o actualiza una referencia en SQL."""
+        try:
+            # 1. Intentamos buscar si ya existe (para hacer update)
+            existing = None
+            
+            # A. Buscamos por ID Maestro (Input original)
+            if ref_data.get("master_notion_id"):
+                existing = self.client.table("candidate_references").select("id").eq("master_notion_id", ref_data["master_notion_id"]).execute()
+            
+            # B. Si no, buscamos por ID Hijo (Update del reclutador)
+            if not (existing and existing.data) and ref_data.get("child_notion_id"):
+                existing = self.client.table("candidate_references").select("id").eq("child_notion_id", ref_data["child_notion_id"]).execute()
 
-MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
-
-def analizar_schema():
-    print("--- INSPECTOR DE ESQUEMA NOTION ---")
-    client = NotionClient()
+            if existing and existing.data:
+                # UPDATE
+                rid = existing.data[0]['id']
+                self.client.table("candidate_references").update(ref_data).eq("id", rid).execute()
+                print(f"      [SUPABASE] Referencia actualizada (ID: {rid})")
+            else:
+                # INSERT
+                self.client.table("candidate_references").insert(ref_data).execute()
+                print(f"      [SUPABASE] Referencia nueva creada.")
+        except Exception as e:
+            print(f"      [ERROR SUPABASE REF] {e}")
     
-    if not MAIN_DB_ID:
-        print("ERROR: No tienes NOTION_MAIN_DB_ID en el .env")
-        return
-
-    print(f"Consultando DB: {MAIN_DB_ID}...")
-    
-    # Usamos requests directamente para obtener la metadata de la DB
-    url = f"https://api.notion.com/v1/databases/{MAIN_DB_ID}"
-    res = client.get_database_schema(client.get_data_source_id(MAIN_DB_ID) or MAIN_DB_ID)
-    
-    # Nota: get_database_schema en tu cliente actual devuelve solo 'properties'.
-    # Vamos a usar eso.
-    
-    if not res:
-        # Fallback: intentamos pedir la DB entera para ver si hay error de acceso
-        import requests
-        headers = client.headers
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            print(f"❌ ERROR FATAL DE ACCESO: {response.status_code}")
-            print(response.text)
-            return
-        res = response.json().get("properties", {})
-
-    print(f"\n✅ Conexión exitosa. Listando columnas detectadas:\n")
-    print(f"{'NOMBRE COLUMNA (CLAVE)':<40} | {'TIPO':<15}")
-    print("-" * 60)
-    
-    for name, data in res.items():
-        tipo = data['type']
-        print(f"'{name}'".ljust(40) + f" | {tipo}")
-
-    print("\n--- INSTRUCCIONES ---")
-    print("Compara la lista de arriba con tu archivo 'core/data_mapper.py'.")
-    print("Busca diferencias exactas (mayúsculas, espacios al final, plurales).")
-
-if __name__ == "__main__":
-    analizar_schema()
 
 ============================================================
 RUTA: .\scripts\factory_worker.py
@@ -915,7 +1106,7 @@ load_dotenv()
 # --- CONFIGURACIÓN ---
 PROCESS_DASHBOARD_DB_ID = os.getenv("NOTION_PROCESS_DASHBOARD_DB_ID")
 MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
-POLLING_INTERVAL = 10 
+POLLING_INTERVAL = 10
 
 class FactoryWorkerV2:
     def __init__(self):
@@ -955,19 +1146,23 @@ class FactoryWorkerV2:
             if not raw_select: return 
             tipo_proceso = raw_select["name"]
             
+            # Detectar si es PortCo o Nzyme (para el renombrado de JD)
+            es_portco = "PortCo" in tipo_proceso
+            
             print(f"--> Configurando: {nombre_proceso} ({tipo_proceso})")
         except Exception as e:
             print(f"   [ERROR DATOS] {e}")
             return
 
         # 2. Espera de Seguridad (Vital para templates)
-        print("   Esperando 10s para propagación de estructura interna...")
-        time.sleep(10)
+        print("   Esperando 5s para propagación de estructura interna...")
+        time.sleep(1)
 
-        # 3. Identificar Bases de Datos Hijas (Introspección)
+        # 3. Identificar Bases de Datos Hijas y Páginas (Introspección)
         bloques = self.notion.get_page_blocks(page_id)
         wf_db_id = None
         form_db_id = None
+        jd_page_id = None
 
         for b in bloques:
             if b["type"] == "child_database":
@@ -979,6 +1174,12 @@ class FactoryWorkerV2:
                 elif "form" in titulo:
                     form_db_id = bid
                     print(f"   Detectado FORM: {bid}")
+            elif b["type"] == "child_page":
+                titulo = b.get("child_page", {}).get("title", "").lower()
+                bid = b["id"]
+                if "job" in titulo or "role" in titulo:
+                    jd_page_id = bid
+                    print(f"   Detectada JD PAGE: {bid}")
 
         if not wf_db_id or not form_db_id:
             print("   [ERROR CRITICO] No se encontraron las DBs hijas. Revisa el template del botón.")
@@ -990,22 +1191,22 @@ class FactoryWorkerV2:
         if doc_guidelines:
             opciones_stages = self.parser.parsear_stages_desde_pagina(doc_guidelines["id"])
             print(f"   Stages extraidos: {len(opciones_stages)}")
+            # FIX ORDEN NOTION: Zero-width spaces invisibles para forzar orden secuencial
+            ZWSP = chr(0x200B)  # Zero Width Space (invisible)
+            for i, stage in enumerate(opciones_stages):
+                stage["name"] = ZWSP * i + stage["name"]
         else:
             print("   [AVISO] Guidelines no encontrados. Se usarán stages por defecto.")
 
         # --- 5. CONFIGURAR WORKFLOW (RENOMBRADO + STAGES) ---
         print("   Configurando Workflow DB...")
-        
-        # A. Renombrar (Database Update)
         self.notion.update_database(wf_db_id, title=f"Workflow - {nombre_proceso}")
         
-        # B. Inyectar Stages (Data Source Update)
         if opciones_stages:
             wf_ds_id = self.notion.get_data_source_id(wf_db_id)
             if wf_ds_id:
                 print(f"   Inyectando stages en Data Source {wf_ds_id}...")
                 wf_updates = {"Stage": {"select": {"options": opciones_stages}}}
-                
                 res_schema = self.notion.update_data_source(wf_ds_id, properties=wf_updates)
                 if res_schema.status_code != 200:
                     print(f"   [ERROR STAGES] {res_schema.status_code}: {res_schema.text}")
@@ -1014,13 +1215,46 @@ class FactoryWorkerV2:
 
         # --- 6. CONFIGURAR FORM DB (RENOMBRADO) ---
         print("   Configurando Form DB...")
-        self.notion.update_database(form_db_id, title=f"Form - {nombre_proceso}")
+        self.notion.update_database(form_db_id, title=f"Candidate Form - {nombre_proceso}")
 
-        # --- 7. REGISTRAR EN SUPABASE (BACKEND) ---
-        # Guardamos en la tabla 'processes'
+        # --- 7. CONFIGURAR JOB DESCRIPTION (CON LÓGICA DE INSERCIÓN ARRIBA) ---
+        if jd_page_id:
+            print("   Configurando Job Description...")
+            
+            # A. Buscar contenido fuente
+            doc_jd = self.parser.buscar_documento_job_description(tipo_proceso)
+            if doc_jd:
+                print(f"   Fuente JD encontrada: {doc_jd['id']}")
+                contenido_bloques = self.parser.extraer_contenido_pagina(doc_jd["id"])
+                
+                if contenido_bloques:
+                    # B. BUSCAR EL BLOQUE ANCLA (La primera línea vacía)
+                    bloques_existentes = self.notion.get_page_blocks(jd_page_id)
+                    id_ancla = None
+                    
+                    if bloques_existentes:
+                        # Asumimos que el primer bloque es tu línea vacía
+                        id_ancla = bloques_existentes[0]["id"]
+                        print(f"   Ancla encontrada (Insertando después del primer bloque): {id_ancla}")
+                    
+                    # C. Pegar contenido (Usando 'after' si encontramos ancla)
+                    print(f"   Copiando {len(contenido_bloques)} bloques...")
+                    self.notion.append_block_children(
+                        jd_page_id, 
+                        contenido_bloques[:100], 
+                        after=id_ancla # <--- AQUÍ ESTÁ LA MAGIA
+                    )
+            else:
+                print("   [AVISO] No se encontró documento 'Job Description' en Guidelines.")
+
+            # D. Renombrar Página
+            nuevo_titulo_jd = f"Role & Candidate Description - {nombre_proceso}" if es_portco else f"Job Description - {nombre_proceso}"
+            self.notion.update_page(jd_page_id, properties={"title": [{"text": {"content": nuevo_titulo_jd}}]})
+
+        # --- 8. REGISTRAR EN SUPABASE (BACKEND) ---
         exito_supa = self.supa.registrar_proceso(wf_db_id, form_db_id, nombre_proceso, tipo_proceso)
 
-        # 8. CIERRE
+        # 9. CIERRE
         if exito_supa:
             print("   Finalizando tarea...")
             self.notion.update_page(page_id, properties={"Processed [Do not touch]": {"checkbox": True}})
@@ -1029,7 +1263,7 @@ class FactoryWorkerV2:
             print("   [ERROR SUPABASE] Fallo al registrar. No se marca como procesado.")
 
     def run(self):
-        print("--- FACTORY WORKER V5 ---")
+        print("--- FACTORY WORKER V6 ---")
         self._init_datasources()
         try:
             while True:
@@ -1050,6 +1284,7 @@ import os
 import time
 import re
 import requests
+import json
 from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1091,18 +1326,34 @@ class HarvesterRelational:
             return path
         except: return None
 
-    def buscar_candidato_madre_completo(self, email, nombre):
+    # --- LOGICA DE BÚSQUEDA INTELIGENTE ---
+    def buscar_candidato_smart(self, email, nombre):
         """
-        Devuelve el objeto página completo de Notion si existe.
-        Necesario para leer el historial previo.
+        Busca si el candidato ya existe en Notion para decidir si crear o actualizar.
+        1. Si hay email -> Buscar por Email (Prioridad Alta).
+        2. Si no -> Buscar por Nombre (Prioridad Media).
         """
+        # A. Búsqueda por Email
         if email:
             res = self.notion.query_data_source(self.main_ds_id, {"property": "Email", "email": {"equals": email}})
-            if res: return res[0]
+            if res: return res[0] # Match seguro
         
-        # Si no hay email o no se encuentra, buscamos por nombre
+        # B. Búsqueda por Nombre
         res = self.notion.query_data_source(self.main_ds_id, {"property": "Name", "title": {"equals": nombre}})
-        if res: return res[0]
+        if res:
+            candidate_page = res[0]
+            existing_email = candidate_page["properties"].get("Email", {}).get("email")
+            
+            # Validación de Seguridad:
+            if not existing_email:
+                return candidate_page # Match (Candidato antiguo sin email)
+            
+            if email and existing_email == email:
+                return candidate_page # Match (Emails coinciden)
+                
+            # Si nombres coinciden pero emails son distintos -> SON DISTINTOS
+            print(f"      [INFO] Homónimo detectado: '{nombre}' existe con otro email. Creando nuevo.")
+            return None
         
         return None
 
@@ -1111,13 +1362,7 @@ class HarvesterRelational:
         opciones = schema.get("Stage", {}).get("select", {}).get("options", [])
         if not opciones: opciones = schema.get("Stage", {}).get("status", {}).get("options", [])
         if not opciones: return None
-        mejor = None; menor = float('inf')
-        for op in opciones:
-            match = re.match(r"(\d+(\.\d+)?)", op["name"])
-            if match:
-                try: v = float(match.group(1)); (menor, mejor) = (v, op["name"]) if v < menor else (menor, mejor)
-                except: pass
-        return mejor if mejor else (opciones[0]["name"] if opciones else None)
+        return opciones[0]["name"] if opciones else None
 
     def encontrar_propiedad_relacion(self, ds_id):
         schema = self.notion.get_database_schema(ds_id)
@@ -1150,115 +1395,118 @@ class HarvesterRelational:
         
         return files[0]["file"]["url"], files[0]["name"]
 
-    # --- LÓGICA PRINCIPAL ---
+    # --- PROCESAMIENTO ---
     def procesar_candidato(self, cand, process_entry, relation_col_name, stage_inicial):
         page_id = cand["id"]
         props = cand["properties"]
         wf_db_id = process_entry["notion_workflow_id"]
         aux_db_id = process_entry["notion_form_id"]
         
-        # 1. Obtener ID Puente
-        id_text_list = props.get("ID", {}).get("rich_text", [])
-        id_text = id_text_list[0]["plain_text"] if id_text_list else ""
+        # Extracción de datos del proceso
+        process_name_actual = process_entry["process_name"]
+        process_type_actual = process_entry.get("process_type") # NUEVO: Tipo de proceso (ej: Investment - VP)
+        
+        id_text = props.get("ID", {}).get("rich_text", [])[0]["plain_text"] if props.get("ID", {}).get("rich_text", []) else ""
         print(f"   Procesando ID Enlace: {id_text}...")
 
-        # 2. Descargar CV
+        # 1. Obtener CV
         notion_url, file_name = self.buscar_cv_en_auxiliar(aux_db_id, id_text)
         if not notion_url:
-            print(f"      [AVISO] No se encontró CV en Auxiliar. Esperando sincronización...")
+            print(f"      [AVISO] CV no encontrado. Esperando...")
             return
 
         local_path = self.descargar_archivo_temporal(notion_url, file_name)
         if not local_path: return
 
-        # 3. Subir a Supabase Storage
+        # 2. Subir a Storage
         public_url = self.storage.subir_cv_desde_url(notion_url, file_name)
         if not public_url: return
 
-        # 4. Análisis IA
+        # 3. Analizar con IA
         datos_ia = self.ai.procesar_cv(local_path)
         try: os.remove(local_path)
         except: pass
-        
-        if not datos_ia: 
-            print("      [ERROR IA] Fallo lectura.")
-            return
+        if not datos_ia: return
 
-        # --- 5. NOTION MAIN DB: GESTIÓN DE HISTORIAL (CORREGIDO) ---
-        
-        # A. Buscamos si el candidato ya existe para LEER su historial actual
-        candidato_existente = self.buscar_candidato_madre_completo(datos_ia.get("email"), datos_ia["name"])
+        # --- 4. GESTIÓN NOTION MAIN DB ---
+        candidato_existente = self.buscar_candidato_smart(datos_ia.get("email"), datos_ia["name"])
         
         historial_previo = []
+        team_role_previo = [] # Para la nueva columna fusionada
         id_madre_notion = None
 
         if candidato_existente:
             id_madre_notion = candidato_existente["id"]
-            # Extraemos la lista 'Process History' actual
+            
+            # A. Extraer Historial de Procesos
             raw_history = candidato_existente["properties"].get("Process History", {}).get("multi_select", [])
             historial_previo = [tag["name"] for tag in raw_history]
-            print(f"      Historial previo detectado: {historial_previo}")
+            
+            # B. Extraer 'Proposed Nzyme Team & Role' existente (NUEVO)
+            # Esto evita que borremos lo que se puso en un referral previo
+            raw_team_role = candidato_existente["properties"].get("Proposed Nzyme Team & Role", {}).get("multi_select", [])
+            team_role_previo = [tag["name"] for tag in raw_team_role]
+            
+            print(f"      Historial recuperado: {len(historial_previo)} procesos.")
 
-        # B. Generamos el payload para Notion pasándole el historial previo
-        # DataMapper se encargará de añadir el proceso actual a esa lista
+        # C. Generar Payload (DataMapper fusiona los datos)
         props_madre = DataMapper.map_to_notion(
             datos_ia, 
             public_url, 
-            process_entry["process_name"],
-            existing_history=historial_previo  # <--- CLAVE DEL ARREGLO
+            process_name_actual, 
+            existing_history=historial_previo,
+            process_type=process_type_actual,   # Pasamos el tipo del proceso actual
+            existing_team_role=team_role_previo # Pasamos lo que ya tenía
         )
         
+        # D. Ejecución en Notion
         error_madre = False
         if not id_madre_notion:
-            print(f"      Creando en Talent Network Notion: {datos_ia['name']}...")
+            print(f"      Creando candidato: {datos_ia['name']}")
             res_create = self.notion.create_page_in_db(MAIN_DB_ID, props_madre)
             if res_create.status_code == 200: 
                 id_madre_notion = res_create.json()["id"]
             else: 
-                print(f"      [ERROR NOTION] {res_create.status_code}")
+                print(f"      [ERROR NOTION CREATE] {res_create.status_code}: {res_create.text}")
                 error_madre = True
+                return 
         else:
-            print("      Actualizando en Talent Network Notion (preservando historial)...")
-            self.notion.update_page(id_madre_notion, props_madre)
+            print(f"      Actualizando candidato: {datos_ia['name']}")
+            res_update = self.notion.update_page(id_madre_notion, props_madre)
+            if res_update.status_code != 200:
+                print(f"      [ERROR NOTION UPDATE] {res_update.status_code}: {res_update.text}")
+                error_madre = True
+                return 
 
-        # 6. SUPABASE: GESTION DE CANDIDATO Y APLICACION
-        # Paso A: Upsert Candidato (usando ID de Notion como ancla)
-        datos_candidato = DataMapper.map_to_supabase_candidate(datos_ia, public_url)
-        uuid_candidato = None
-        
-        # Solo guardamos en Supabase si tenemos un ID de Notion válido (ancla)
-        if id_madre_notion:
+        # 5. SUPABASE SYNC
+        if not error_madre:
+            datos_candidato = DataMapper.map_to_supabase_candidate(datos_ia, public_url)
             uuid_candidato = self.supa_manager.gestion_candidato(datos_candidato, id_madre_notion)
 
-        # Paso B: Upsert Aplicación
-        if uuid_candidato:
-            self.supa_manager.crear_aplicacion(
-                uuid_candidato, 
-                wf_db_id, 
-                page_id, 
-                stage_inicial
-            )
+            if uuid_candidato:
+                self.supa_manager.crear_aplicacion(
+                    uuid_candidato, 
+                    wf_db_id, 
+                    page_id, 
+                    stage_inicial
+                )
 
-        # 7. UPDATE FINAL WORKFLOW
+        # 6. CIERRE
         update_props = {
             "Processed": {"checkbox": True},
             "Name": {"title": [{"text": {"content": datos_ia["name"]}}]},
             "CV": {"files": [{"name": "CV.pdf", "external": {"url": public_url}}]}
         }
-        
-        if id_madre_notion and not error_madre:
+        if id_madre_notion:
             update_props[relation_col_name] = {"relation": [{"id": id_madre_notion}]}
-        else:
-            update_props["Name"] = {"title": [{"text": {"content": f"[ERROR SYNC] {datos_ia['name']}"}}]}
-
         if stage_inicial:
             update_props["Stage"] = {"select": {"name": stage_inicial}}
 
         self.notion.update_page(page_id, update_props)
-        print("      [OK] Procesado y Sincronizado.")
+        print("      [OK] Finalizado.")
 
     def run(self):
-        print("--- HARVESTER V16 ---")
+        print("--- HARVESTER V20 (TEAM & ROLE FUSION) ---")
         try:
             while True:
                 procesos = self.supa_manager.obtener_procesos_activos()
@@ -1277,7 +1525,7 @@ class HarvesterRelational:
                     candidatos = self.notion.query_data_source(ds_wf, filtro)
                     
                     if candidatos:
-                        print(f"--> Procesando {len(candidatos)} en '{proc['process_name']}'")
+                        print(f"--> Detectados {len(candidatos)} en '{proc['process_name']}'")
                         stage_init = self.determinar_stage_inicial(ds_wf)
                         for cand in candidatos:
                             self.procesar_candidato(cand, proc, rel_col, stage_init)
@@ -1295,6 +1543,7 @@ import os
 import time
 import json
 import hashlib
+import requests
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
@@ -1302,28 +1551,33 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
+from core.storage_client import StorageClient
+from core.ai_parser import AnalizadorCV
 from core.data_mapper import DataMapper
 
 load_dotenv()
 
-POLLING_INTERVAL = 3  # Más rápido para captar ráfagas
+POLLING_INTERVAL = 3
 MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
 PROCESS_DASHBOARD_DB_ID = os.getenv("NOTION_PROCESS_DASHBOARD_DB_ID")
+TEMP_FOLDER = "temp_downloads"
+
+if not os.path.exists(TEMP_FOLDER):
+    os.makedirs(TEMP_FOLDER)
 
 class Observer:
     def __init__(self):
         self.notion = NotionClient()
         self.supa = SupabaseManager()
+        self.storage = StorageClient()
+        self.ai = AnalizadorCV()
         
         self.main_ds_id = self.notion.get_data_source_id(MAIN_DB_ID) or MAIN_DB_ID
         self.dashboard_ds_id = self.notion.get_data_source_id(PROCESS_DASHBOARD_DB_ID) or PROCESS_DASHBOARD_DB_ID
 
-        # MEMORIA CACHÉ DE CONTENIDO (NO DE TIEMPO)
-        # Clave: Page ID -> Valor: Hash MD5 del contenido
         self.content_cache = {}
 
     def get_search_window(self):
-        """Ventana solapada de 3 minutos para vencer el lag de Notion."""
         now = datetime.now(timezone.utc)
         start_time = now - timedelta(minutes=3)
         return start_time.isoformat()
@@ -1337,16 +1591,10 @@ class Observer:
         return self.notion.query_data_source(ds_id, filtro)
 
     def calcular_hash(self, data_dict):
-        """Genera una firma única para un diccionario de datos."""
-        # Ordenamos las claves para que el hash sea determinista
         s = json.dumps(data_dict, sort_keys=True, default=str)
         return hashlib.md5(s.encode('utf-8')).hexdigest()
 
     def ha_cambiado_el_contenido(self, page_id, data_dict):
-        """
-        Compara el contenido actual con el último procesado.
-        Devuelve True si hay cambios reales en los datos.
-        """
         nuevo_hash = self.calcular_hash(data_dict)
         ultimo_hash = self.content_cache.get(page_id)
         
@@ -1355,7 +1603,86 @@ class Observer:
             return True
         return False
 
-    # --- VIGILANCIA 1: WORKFLOWS ---
+    def descargar_archivo(self, url, nombre):
+        clean_name = "".join([c for c in nombre if c.isalnum() or c in "._-"])
+        path = os.path.join(TEMP_FOLDER, clean_name)
+        try:
+            with requests.get(url, stream=True) as r:
+                r.raise_for_status()
+                with open(path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
+            return path
+        except Exception as e:
+            print(f"      [ERROR DESCARGA] {e}")
+            return None
+
+    # --- CAMBIO IMPORTANTE AQUÍ ---
+    def detectar_y_enriquecer_cv(self, page):
+        props = page["properties"]
+        page_id = page["id"]
+        
+        cv_files = props.get("CV", {}).get("files", [])
+        if not cv_files: return False
+
+        archivo = cv_files[0]
+        tipo = archivo.get("type")
+
+        if tipo == "file":
+            nombre_archivo = archivo.get("name", "cv.pdf")
+            url_privada_notion = archivo.get("file", {}).get("url")
+            
+            print(f"   [REFERRAL DETECTADO] CV Nuevo encontrado: {nombre_archivo}")
+            
+            local_path = self.descargar_archivo(url_privada_notion, nombre_archivo)
+            if not local_path: return False
+
+            print("      -> Subiendo a Storage...")
+            public_url = self.storage.subir_cv_desde_url(url_privada_notion, nombre_archivo)
+            if not public_url: return False
+
+            print("      -> Analizando con IA...")
+            datos_ia = self.ai.procesar_cv(local_path)
+            try: os.remove(local_path)
+            except: pass
+            
+            if not datos_ia: return False
+
+            # --- PRESERVAR DATOS EXISTENTES ---
+            
+            # 1. Historial
+            current_history_tags = props.get("Process History", {}).get("multi_select", [])
+            current_history = [t["name"] for t in current_history_tags]
+            
+            # 2. Last Process
+            current_process_obj = props.get("Last Process Involved in", {}).get("select")
+            current_process = current_process_obj["name"] if current_process_obj else "Referral/General"
+
+            # 3. NUEVO: Team & Role (Lectura para preservación)
+            # Leemos la nueva columna fusionada
+            current_team_role_tags = props.get("Proposed Nzyme Team & Role", {}).get("multi_select", [])
+            current_team_role = [t["name"] for t in current_team_role_tags]
+
+            # Generamos payload pasando los datos a preservar
+            props_update = DataMapper.map_to_notion(
+                datos_ia,
+                public_url,
+                current_process,
+                existing_history=current_history,
+                existing_team_role=current_team_role # <--- Pasamos la lista para no borrarla
+            )
+            
+            print("      -> Escribiendo datos extraídos en Notion...")
+            res = self.notion.update_page(page_id, props_update)
+            
+            if res.status_code == 200:
+                print("      Enriquecimiento completado.")
+                return True
+            else:
+                print(f"      [ERROR NOTION UPDATE] {res.status_code}: {res.text}")
+                return False
+            
+        return False
+
     def vigilar_workflows(self):
         procesos = self.supa.obtener_procesos_activos()
         if not procesos: return
@@ -1365,7 +1692,6 @@ class Observer:
             ds_id = self.notion.get_data_source_id(wf_db_id)
             if not ds_id: continue
 
-            # Traemos todo lo reciente
             paginas = self.obtener_cambios_notion(ds_id)
             for p in paginas:
                 self.procesar_cambio_stage(p)
@@ -1374,7 +1700,6 @@ class Observer:
         page_id = page["id"]
         props = page["properties"]
         
-        # Extraemos el dato relevante (Stage)
         current_stage = None
         stage_prop = props.get("Stage", {})
         if stage_prop.get("type") == "select" and stage_prop.get("select"):
@@ -1382,14 +1707,10 @@ class Observer:
         
         if not current_stage: return
 
-        # Chequeo de Hash para evitar llamadas a Supabase si no ha cambiado el stage visualmente
-        # (Aunque aquí usamos el hash para filtrar el spam de la ventana de 3 min)
         data_relevante = {"stage": current_stage}
-        
         if not self.ha_cambiado_el_contenido(page_id, data_relevante):
-            return # Ya procesamos este estado exacto en este ciclo de vida
+            return 
 
-        # Lógica de negocio (Consultar Supabase para ver si es un cambio histórico real)
         app_record = self.supa.obtener_aplicacion_por_notion_id(page_id)
         if not app_record: return
 
@@ -1397,56 +1718,58 @@ class Observer:
             print(f"   [WORKFLOW] Stage change: {app_record['current_stage']} -> {current_stage}")
             self.supa.registrar_cambio_stage(app_record["id"], app_record["current_stage"], current_stage)
 
-    # --- VIGILANCIA 2: MAIN DB (AQUI ESTABA EL PROBLEMA) ---
     def vigilar_main_db(self):
         if not self.main_ds_id: return
 
-        # 1. Traemos todo lo que Notion dice que es "reciente" (ventana 3 min)
         paginas = self.obtener_cambios_notion(self.main_ds_id)
         
         for p in paginas:
+            # 1. Enriquecimiento
+            se_ha_enriquecido = self.detectar_y_enriquecer_cv(p)
+            if se_ha_enriquecido:
+                continue
+
+            # 2. Sincronización Estándar
             self.sincronizar_perfil(p)
 
     def sincronizar_perfil(self, page):
         page_id = page["id"]
         props = page["properties"]
         
-        # 2. Extraemos los datos LIMPIOS usando tu DataMapper arreglado
         data_update = DataMapper.map_notion_to_supabase_update(props)
         
-        # 3. FILTRO MAESTRO: ¿Ha cambiado el contenido real?
-        # Comparamos el hash de 'data_update' con lo que teníamos en memoria.
-        # Si cambiaste "Spain" por "Italy" -> El hash cambia -> TRUE.
-        # Si el timestamp cambió pero los datos son iguales -> El hash es igual -> FALSE.
         if not self.ha_cambiado_el_contenido(page_id, data_update):
             return 
 
         name = data_update.get("name", "Desconocido")
         print(f"   [MAIN DB] Cambio detectado en: {name}")
-        
-        # 4. Upsert
         self.supa.gestion_candidato(data_update, page_id)
 
-    # --- VIGILANCIA 3: DASHBOARD ---
     def vigilar_dashboard(self):
         if not self.dashboard_ds_id: return
         paginas = self.obtener_cambios_notion(self.dashboard_ds_id)
-        
-        for p in paginas:
-            self.sincronizar_estado_proceso(p)
+        for p in paginas: self.sincronizar_estado_proceso(p)
 
     def sincronizar_estado_proceso(self, page):
         page_id = page["id"]
         props = page["properties"]
-        
         try:
-            name = props.get("Name", {}).get("title", [])[0]["plain_text"]
-            status_prop = props.get("Open/Closed", {}).get("select") or props.get("Status", {}).get("status")
-            new_status = status_prop["name"] if status_prop else None
-        except: return
+            name_prop = props.get("Name", {}).get("title", [])
+            if not name_prop: return
+            name = name_prop[0]["plain_text"]
 
-        if not new_status: return
-        
+            status_prop = props.get("Open/Closed") or props.get("Status")
+            
+            new_status = None
+            if status_prop:
+                if status_prop["type"] == "select" and status_prop["select"]:
+                    new_status = status_prop["select"]["name"]
+                elif status_prop["type"] == "status" and status_prop["status"]:
+                    new_status = status_prop["status"]["name"]
+            
+            if not new_status: return
+        except Exception as e: return
+
         data_relevante = {"status": new_status, "name": name}
         if not self.ha_cambiado_el_contenido(page_id, data_relevante):
             return
@@ -1455,8 +1778,8 @@ class Observer:
         self.supa.actualizar_estado_proceso_por_nombre(name, new_status)
 
     def run(self):
-        print("\n--- OBSERVER V7 ---")
-        print(f"Polling: {POLLING_INTERVAL}s. Estrategia: Integridad de Contenido.")
+        print("\n--- OBSERVER V10 (TEAM & ROLE PRESERVATION) ---")
+        print(f"Polling: {POLLING_INTERVAL}s. Estrategia: Content Hash + Auto-Enrichment.")
         
         try:
             while True:
@@ -1471,9 +1794,7 @@ class Observer:
                 
                 print(".", end="", flush=True)
                 time.sleep(POLLING_INTERVAL)
-                
-        except KeyboardInterrupt:
-            print("\nObserver detenido.")
+        except KeyboardInterrupt: print("\nObserver detenido.")
 
 if __name__ == "__main__":
     Observer().run()

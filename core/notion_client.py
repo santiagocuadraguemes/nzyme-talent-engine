@@ -33,6 +33,21 @@ class NotionClient:
             return response.json().get("results", [])
         return []
 
+    def append_block_children(self, block_id, children, after=None):
+        """
+        Añade bloques.
+        - Si 'after' es None: Añade al final.
+        - Si 'after' es un ID de bloque: Añade justo después de ese bloque.
+        """
+        url = f"{self.base_url}/blocks/{block_id}/children"
+        payload = {"children": children}
+        
+        if after:
+            payload["after"] = after
+        
+        response = requests.patch(url, headers=self.headers, json=payload)
+        return response
+
     def query_data_source(self, data_source_id, filter_params):
         """Consulta datos usando el Data Source ID."""
         url = f"{self.base_url}/data_sources/{data_source_id}/query"
@@ -99,3 +114,44 @@ class NotionClient:
         response = requests.get(url, headers=self.headers)
         if response.status_code == 200: return response.json().get("properties", {})
         return {}
+
+    def search_recently_edited(self, since_iso_timestamp):
+        """
+        Busca páginas modificadas ordenadas por fecha.
+        Filtra en Python las que sean más recientes que el timestamp dado.
+        """
+        url = f"{self.base_url}/search"
+        
+        # Pedimos a Notion las últimas 100 páginas modificadas
+        payload = {
+            "filter": {"value": "page", "property": "object"},
+            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+            "page_size": 100
+        }
+        
+        response = requests.post(url, headers=self.headers, json=payload)
+        
+        if response.status_code == 200:
+            results = response.json().get("results", [])
+            filtered = []
+            # Filtramos nosotros manualmente
+            for page in results:
+                last_edited = page.get("last_edited_time")
+                # Comparación de cadenas ISO 8601 funciona correctamente
+                if last_edited and last_edited > since_iso_timestamp:
+                    filtered.append(page)
+            return filtered
+            
+        print(f"[API ERROR] Search failed ({response.status_code}): {response.text}")
+        return []
+
+    def find_child_database(self, parent_page_id, db_title_contains):
+        """Busca una base de datos hija dentro de una página."""
+        # Nota: get_page_blocks ya debe estar implementado
+        children = self.get_page_blocks(parent_page_id)
+        for block in children:
+            if block["type"] == "child_database":
+                title = block.get("child_database", {}).get("title", "").lower()
+                if db_title_contains.lower() in title:
+                    return block["id"]
+        return None

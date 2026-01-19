@@ -13,7 +13,9 @@ from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
 from core.storage_client import StorageClient
 from core.ai_parser import AnalizadorCV
-from core.data_mapper import DataMapper
+from core.notion_parser import NotionParser
+from core.notion_builder import NotionBuilder
+from core.logger import get_logger
 
 load_dotenv()
 
@@ -26,15 +28,15 @@ if not os.path.exists(TEMP_FOLDER):
     os.makedirs(TEMP_FOLDER)
 
 class Observer:
-    def __init__(self):
-        self.notion = NotionClient()
-        self.supa = SupabaseManager()
-        self.storage = StorageClient()
-        self.ai = AnalizadorCV()
-        
+    def __init__(self, notion_client, supa_client, storage_client, ai_analyzer):
+        self.logger = get_logger("Observer")
+        self.notion = notion_client
+        self.supa = supa_client
+        self.storage = storage_client
+        self.ai = ai_analyzer
+
         self.main_ds_id = self.notion.get_data_source_id(MAIN_DB_ID) or MAIN_DB_ID
         self.dashboard_ds_id = self.notion.get_data_source_id(PROCESS_DASHBOARD_DB_ID) or PROCESS_DASHBOARD_DB_ID
-
         self.content_cache = {}
 
     def get_search_window(self):
@@ -73,7 +75,7 @@ class Observer:
                     for chunk in r.iter_content(chunk_size=8192): f.write(chunk)
             return path
         except Exception as e:
-            print(f"      [ERROR DESCARGA] {e}")
+            self.logger.error(f"[ERROR DESCARGA] {e}")
             return None
 
     # --- CAMBIO IMPORTANTE AQUÍ ---
@@ -91,16 +93,16 @@ class Observer:
             nombre_archivo = archivo.get("name", "cv.pdf")
             url_privada_notion = archivo.get("file", {}).get("url")
             
-            print(f"   [REFERRAL DETECTADO] CV Nuevo encontrado: {nombre_archivo}")
+            self.logger.info(f"[REFERRAL DETECTADO] CV Nuevo encontrado: {nombre_archivo}")
             
             local_path = self.descargar_archivo(url_privada_notion, nombre_archivo)
             if not local_path: return False
 
-            print("      -> Subiendo a Storage...")
+            self.logger.info("-> Subiendo a Storage...")
             public_url = self.storage.subir_cv_desde_url(url_privada_notion, nombre_archivo)
             if not public_url: return False
 
-            print("      -> Analizando con IA...")
+            self.logger.info("-> Analizando con IA...")
             datos_ia = self.ai.procesar_cv(local_path)
             try: os.remove(local_path)
             except: pass
@@ -123,7 +125,7 @@ class Observer:
             current_team_role = [t["name"] for t in current_team_role_tags]
 
             # Generamos payload pasando los datos a preservar
-            props_update = DataMapper.map_to_notion(
+            props_update = NotionBuilder.build_candidate_payload(
                 datos_ia,
                 public_url,
                 current_process,
@@ -131,14 +133,14 @@ class Observer:
                 existing_team_role=current_team_role # <--- Pasamos la lista para no borrarla
             )
             
-            print("      -> Escribiendo datos extraídos en Notion...")
+            self.logger.info("-> Escribiendo datos extraídos en Notion...")
             res = self.notion.update_page(page_id, props_update)
             
             if res.status_code == 200:
-                print("      Enriquecimiento completado.")
+                self.logger.info("Enriquecimiento completado.")
                 return True
             else:
-                print(f"      [ERROR NOTION UPDATE] {res.status_code}: {res.text}")
+                self.logger.error(f"[ERROR NOTION UPDATE] {res.status_code}: {res.text}")
                 return False
             
         return False
@@ -175,7 +177,7 @@ class Observer:
         if not app_record: return
 
         if app_record["current_stage"] != current_stage:
-            print(f"   [WORKFLOW] Stage change: {app_record['current_stage']} -> {current_stage}")
+            self.logger.info(f"[WORKFLOW] Stage change: {app_record['current_stage']} -> {current_stage}")
             self.supa.registrar_cambio_stage(app_record["id"], app_record["current_stage"], current_stage)
 
     def vigilar_main_db(self):
@@ -196,13 +198,13 @@ class Observer:
         page_id = page["id"]
         props = page["properties"]
         
-        data_update = DataMapper.map_notion_to_supabase_update(props)
+        data_update = NotionParser.parse_candidate_properties(props)
         
         if not self.ha_cambiado_el_contenido(page_id, data_update):
             return 
 
         name = data_update.get("name", "Desconocido")
-        print(f"   [MAIN DB] Cambio detectado en: {name}")
+        self.logger.info(f"[MAIN DB] Cambio detectado en: {name}")
         self.supa.gestion_candidato(data_update, page_id)
 
     def vigilar_dashboard(self):
@@ -234,27 +236,39 @@ class Observer:
         if not self.ha_cambiado_el_contenido(page_id, data_relevante):
             return
 
-        print(f"   [DASHBOARD] Estado proceso '{name}' -> {new_status}")
+        self.logger.info(f"[DASHBOARD] Estado proceso '{name}' -> {new_status}")
         self.supa.actualizar_estado_proceso_por_nombre(name, new_status)
 
     def run(self):
-        print("\n--- OBSERVER V10 (TEAM & ROLE PRESERVATION) ---")
-        print(f"Polling: {POLLING_INTERVAL}s. Estrategia: Content Hash + Auto-Enrichment.")
+        self.logger.info("\n--- OBSERVER ---")
+        self.logger.info(f"Polling: {POLLING_INTERVAL}s. Estrategia: Content Hash + Auto-Enrichment.")
         
         try:
             while True:
                 try: self.vigilar_workflows()
-                except Exception as e: print(f"[ERR WORKFLOWS] {e}")
+                except Exception as e: self.logger.error(f"[ERR WORKFLOWS] {e}", exc_info=True)
 
                 try: self.vigilar_main_db()
-                except Exception as e: print(f"[ERR MAIN DB] {e}")
+                except Exception as e: self.logger.error(f"[ERR MAIN DB] {e}", exc_info=True)
 
                 try: self.vigilar_dashboard()
-                except Exception as e: print(f"[ERR DASHBOARD] {e}")
+                except Exception as e: self.logger.error(f"[ERR DASHBOARD] {e}", exc_info=True)
                 
-                print(".", end="", flush=True)
+                print(".", end="", flush=True) # Este lo dejamos como print para el latido visual simple
                 time.sleep(POLLING_INTERVAL)
-        except KeyboardInterrupt: print("\nObserver detenido.")
+        except KeyboardInterrupt: self.logger.info("\nObserver detenido.")
 
 if __name__ == "__main__":
-    Observer().run()
+    n_client = NotionClient()
+    s_client = SupabaseManager()
+    st_client = StorageClient()
+    ai_agent = AnalizadorCV()
+
+    obs = Observer(
+        notion_client=n_client,
+        supa_client=s_client,
+        storage_client=st_client,
+        ai_analyzer=ai_agent
+    )
+    
+    obs.run()
