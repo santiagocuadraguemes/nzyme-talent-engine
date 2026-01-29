@@ -1,0 +1,7 @@
+requests
+python-dotenv
+openai
+pydantic
+pdfplumber
+supabase
+logfire[openai]

@@ -15,7 +15,7 @@ class StorageClient:
             raise ValueError("Faltan credenciales de Supabase en .env")
 
         self.supabase = create_client(url, key)
-        self.bucket_name = "cv-archive" # Asegurate de que este bucket existe en Supabase y es Publico
+        self.bucket_name = "resumes" 
 
     def subir_cv_desde_url(self, notion_url, nombre_archivo):
         """

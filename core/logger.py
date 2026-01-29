@@ -1,46 +1,38 @@
 import logging
 import os
-from logging.handlers import RotatingFileHandler
-
-# Crear carpeta de logs si no existe
-LOG_DIR = "logs"
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
+import sys
 
 def get_logger(name):
     """
-    Configura y devuelve un logger con el nombre especificado.
-    Guarda en archivo (rotativo) y muestra en consola.
+    Configura y devuelve un logger adaptado para AWS Lambda (CloudWatch).
+    - No escribe en ficheros (evita errores de Read-only file system).
+    - Escribe en stdout (Consola), que CloudWatch captura automáticamente.
+    - El nivel de log se define por variable de entorno LOG_LEVEL.
     """
     logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO) # Nivel mínimo global
+    
+    # Leemos el nivel desde el entorno. Por defecto INFO.
+    # Opciones: DEBUG, INFO, WARNING, ERROR, CRITICAL
+    log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+    
+    logger.setLevel(log_level)
 
-    # Evitar duplicar handlers si se llama varias veces
+    # Evitar duplicar handlers si se llama varias veces (Lambda a veces reutiliza contextos)
     if logger.hasHandlers():
         return logger
 
-    # Formato: [FECHA HORA] [NOMBRE] [NIVEL] Mensaje
+    # Formato simple. En CloudWatch el timestamp ya lo pone AWS, 
+    # pero lo dejamos para claridad si lo corres en local.
     formatter = logging.Formatter(
-        '[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        '[%(levelname)s] [%(name)s] %(message)s'
     )
 
-    # 1. Handler de Archivo (Rota cada 5MB, guarda los últimos 3 archivos)
-    file_handler = RotatingFileHandler(
-        os.path.join(LOG_DIR, "app.log"), 
-        maxBytes=5*1024*1024, 
-        backupCount=3,
-        encoding='utf-8'
-    )
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.INFO)
-
-    # 2. Handler de Consola (Lo que ves en pantalla)
-    console_handler = logging.StreamHandler()
+    # Solo Handler de Consola
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(log_level)
 
-    logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
     return logger

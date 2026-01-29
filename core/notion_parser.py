@@ -7,6 +7,7 @@ class NotionParser:
     
     @staticmethod
     def _extract_tags(prop_data):
+        """Extrae lista de strings de propiedades Select o Multi-select."""
         if not prop_data: return []
         if "multi_select" in prop_data:
             return [item["name"] for item in prop_data["multi_select"]]
@@ -16,6 +17,7 @@ class NotionParser:
 
     @staticmethod
     def _extract_text(prop_data):
+        """Extrae string de propiedades Title, Rich Text o Text."""
         if not prop_data: return None
         if "rich_text" in prop_data:
             parts = prop_data["rich_text"]
@@ -31,37 +33,36 @@ class NotionParser:
         select = prop_data.get("select")
         return select["name"] if select else None
 
-    @staticmethod
-    def extract_title(prop):
-        if not prop: return ""
-        return "".join([t["plain_text"] for t in prop.get("title", [])])
-
-    @staticmethod
-    def extract_multiselect_as_string(prop):
-        """Devuelve valores unidos por comas (para logs o SQL simple)."""
-        if not prop or not prop.get("multi_select"): return None
-        return ", ".join([opt["name"] for opt in prop["multi_select"]])
-
-    # --- MÉTODO PRINCIPAL DE PARSEO (Observer) ---
+    # --- MÉTODO PRINCIPAL DE PARSEO ---
 
     @staticmethod
     def parse_candidate_properties(notion_props):
-        """
-        Convierte las propiedades crudas de Notion en un diccionario limpio.
-        """
         data = {}
         
-        # Extracción básica usando CONSTANTES
+        # 1. CAMPOS SQL (Columnas de primera clase)
         raw_name = notion_props.get(PROP_NAME, {}).get("title", [])
         if raw_name: data["name"] = raw_name[0]["plain_text"]
         
         email = notion_props.get(PROP_EMAIL, {}).get("email")
         data["email"] = email if email else None
         
+        phone = notion_props.get(PROP_PHONE, {}).get("phone_number")
+        data["phone"] = phone if phone else None
+
         linkedin = notion_props.get(PROP_LINKEDIN, {}).get("url")
         data["linkedin_url"] = linkedin if linkedin else None
 
-        # Extracción de URL de CV
+        # --- NUEVOS CAMPOS SQL ---
+        
+        # Creator y Source son TEXTO en Notion
+        data["creator"] = NotionParser._extract_text(notion_props.get(PROP_CREATOR))
+        data["source"] = NotionParser._extract_text(notion_props.get(PROP_SOURCE))
+        
+        # Assessment es TAG en Notion -> Lo convertimos a String para SQL
+        tags_assessment = NotionParser._extract_tags(notion_props.get(PROP_ASSESSMENT))
+        data["assessment"] = ", ".join(tags_assessment) if tags_assessment else None
+
+        # CV URL
         cv_files = notion_props.get(PROP_CV_FILES, {}).get("files", [])
         if cv_files:
             archivo = cv_files[0]
@@ -72,17 +73,12 @@ class NotionParser:
         else:
             data["cv_url"] = None
 
-        # Datos extra (Listas y Selects)
-        extra_data = {
-            "cultural_fit": NotionParser._extract_tags(notion_props.get(PROP_CULTURAL_FIT)),
-            "capabilities_assessment": NotionParser._extract_tags(notion_props.get(PROP_CAPABILITIES)),
-            "referred_by": NotionParser._extract_text(notion_props.get(PROP_SOURCE)),
-            "last_process": NotionParser._extract_select_name(notion_props.get(PROP_LAST_PROCESS)),
-            "process_history": NotionParser._extract_tags(notion_props.get(PROP_PROCESS_HISTORY)),
-            "proposed_team_role": NotionParser._extract_tags(notion_props.get(PROP_TEAM_ROLE))
-        }
-
-        # Mapeo de columnas de Experiencia usando CONSTANTES
+        # 2. CAMPOS JSON (Flexible Data)
+        
+        process_history = NotionParser._extract_tags(notion_props.get(PROP_PROCESS_HISTORY))
+        proposed_teams = NotionParser._extract_tags(notion_props.get(PROP_TEAM_ROLE))
+        
+        # Mapeo de columnas de Experiencia
         exp_fields_map = {
             PROP_EXP_CONSULTING: "consulting",
             PROP_EXP_AUDIT: "audit",
@@ -97,7 +93,6 @@ class NotionParser:
             PROP_EXP_PORTCO: "portco_roles"
         }
 
-        # Construcción del objeto JSON completo
         candidate_data_json = {
             "name": data.get("name"),
             "email": data.get("email"),
@@ -105,27 +100,23 @@ class NotionParser:
             "total_years_range": NotionParser._extract_select_name(notion_props.get(PROP_EXP_TOTAL_YEARS)),
             "languages": NotionParser._extract_tags(notion_props.get(PROP_LANGUAGES)),
             
-            "last_process": extra_data["last_process"],
-            "process_history": extra_data["process_history"],
-            "proposed_team_role": extra_data["proposed_team_role"],
+            # Plurales
+            "recruiting_processes_history": process_history,
+            "proposed_teams_roles": proposed_teams,
             
             "general": {
                 "international_locations": NotionParser._extract_tags(notion_props.get(PROP_EXP_INTERNATIONAL)),
                 "industries_specialized": NotionParser._extract_tags(notion_props.get(PROP_EXP_INDUSTRIES)),
-                "cultural_fit": extra_data["cultural_fit"],
-                "capabilities": extra_data["capabilities_assessment"],
-                "source": extra_data["referred_by"]
             },
             "education": {
                 "bachelors": NotionParser._extract_tags(notion_props.get(PROP_EDU_BACHELORS)),
                 "masters": NotionParser._extract_tags(notion_props.get(PROP_EDU_MASTERS)),
-                "university": NotionParser._extract_tags(notion_props.get(PROP_EDU_UNIVERSITY)),
-                "mba": NotionParser._extract_tags(notion_props.get(PROP_EDU_MBA))
+                "universities": NotionParser._extract_tags(notion_props.get(PROP_EDU_UNIVERSITIES)),
+                "mbas": NotionParser._extract_tags(notion_props.get(PROP_EDU_MBAS))
             },
             "experience": {}
         }
 
-        # Reconstrucción de objetos de experiencia
         for notion_col, json_key in exp_fields_map.items():
             tags = NotionParser._extract_tags(notion_props.get(notion_col))
             candidate_data_json["experience"][json_key] = DomainMapper.reconstruct_experience_object(tags)
