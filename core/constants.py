@@ -44,6 +44,12 @@ PROP_EXP_FOUNDER = "EXPERIENCE: Founder"
 PROP_EXP_MANAGEMENT = "EXPERIENCE: Management (at companies)"
 PROP_EXP_CORP_MA = "EXPERIENCE: Corporate M&A or Integrations"
 PROP_EXP_PORTCO = "EXPERIENCE: PE PortCo Roles"
+PROP_EXP_FINANCE = "EXPERIENCE: Finance (at companies)"
+PROP_EXP_MARKETING = "EXPERIENCE: Marketing (at companies)"
+PROP_EXP_OPERATIONS = "EXPERIENCE: Operations (at companies)"
+PROP_EXP_PRODUCT = "EXPERIENCE: Product (at companies)"
+PROP_EXP_SALES_REVENUE = "EXPERIENCE: Sales/Revenue (at companies)"
+PROP_EXP_TECHNOLOGY = "EXPERIENCE: Technology (at companies)"
 PROP_EXP_TOTAL_YEARS = "EXPERIENCE: Total Years"
 PROP_EXP_INTERNATIONAL = "EXPERIENCE: International"
 PROP_EXP_INDUSTRIES = "EXPERIENCE: Industries"
@@ -53,6 +59,8 @@ PROP_EXP_INDUSTRIES = "EXPERIENCE: Industries"
 PROP_ID = "ID"
 PROP_CHECKBOX_PROCESSED = "Processed"
 PROP_STAGE = "Stage"
+PROP_HEADHUNTER = "Headhunter"  # Checkbox in Form DB
+PROP_NEXT_STEPS = "Next Steps"
 
 
 # --- PROCESS DASHBOARD (FACTORY WORKER) --- <--- NEW BLOCK!

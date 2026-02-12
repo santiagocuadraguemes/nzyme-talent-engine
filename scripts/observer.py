@@ -4,11 +4,7 @@ import requests
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
-
-
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
 
 from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
@@ -16,9 +12,11 @@ from core.storage_client import StorageClient
 from core.ai_parser import AnalizadorCV
 from core.notion_parser import NotionParser
 from core.notion_builder import NotionBuilder
+from core.domain_mapper import DomainMapper
 from core.utils import descargar_archivo
 from core.logger import get_logger
-from core.constants import PROP_NAME, PROP_EMAIL, PROP_PHONE, PROP_LINKEDIN, PROP_CV_FILES
+from core.markdown_to_blocks import markdown_to_notion_blocks
+from core.constants import PROP_NAME, PROP_EMAIL, PROP_PHONE, PROP_LINKEDIN, PROP_CV_FILES, PROP_NEXT_STEPS, PROP_PROCESS_HISTORY, PROP_TEAM_ROLE, PROP_CHECKBOX_PROCESSED
 
 
 
@@ -31,7 +29,7 @@ LOOKBACK_MINUTES = 25
 MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
 PROCESS_DASHBOARD_DB_ID = os.getenv("NOTION_PROCESS_DASHBOARD_DB_ID")
 CENTRAL_REFS_DB_ID = os.getenv("NOTION_REFERENCES_DB_ID")
-INTERNAL_REFS_DB_TITLE = "References to Check"
+INTERNAL_REFS_DB_TITLE = "Candidate References [Input here feedback received]"
 TEMP_FOLDER = "/tmp/temp_downloads"
 
 
@@ -42,12 +40,13 @@ if not os.path.exists(TEMP_FOLDER):
 
 
 class Observer:
-    def __init__(self, notion_client, supa_client, storage_client, ai_analyzer):
+    def __init__(self, notion_client, supa_client, storage_client, ai_analyzer, exa_client=None):
         self.logger = get_logger("Observer")
         self.notion = notion_client
         self.supa = supa_client
         self.storage = storage_client
         self.ai = ai_analyzer
+        self.exa = exa_client
 
 
 
@@ -200,11 +199,17 @@ class Observer:
             self._logic_dispatch_candidate_to_form(page, process_dashboard_page_id)
             return # Detenemos aquí para no hacer sync normal en este ciclo
 
-        # 2. Lógica normal (Enriquecimiento y Sync)
-        se_ha_enriquecido = self._logic_enrich_cv(page)
-        if se_ha_enriquecido:
-            return
+        # 2. Enrichment (only if not already processed)
+        if not props.get(PROP_CHECKBOX_PROCESSED, {}).get("checkbox", False):
+            se_ha_enriquecido = self._logic_enrich_cv(page)
+            if se_ha_enriquecido:
+                return
 
+            se_ha_enriquecido = self._logic_enrich_linkedin(page)
+            if se_ha_enriquecido:
+                return
+
+        # 3. Basic Supabase sync (always runs as fallback)
         page_id = page["id"]
         data_update = NotionParser.parse_candidate_properties(props)
         self.supa.gestion_candidato(data_update, page_id)
@@ -264,92 +269,78 @@ class Observer:
 
 
 
-        file_obj = files[0]
-        file_url = file_obj.get("file", {}).get("url") or file_obj.get("external", {}).get("url")
-        if not file_url: return
+        for file_obj in files:
+            try:
+                file_url = file_obj.get("file", {}).get("url") or file_obj.get("external", {}).get("url")
+                if not file_url:
+                    self.logger.warning(f"Feedback file '{file_obj.get('name', '?')}' has no URL, skipping")
+                    continue
 
+                local_path = descargar_archivo(file_url, file_obj["name"], TEMP_FOLDER)
+                if not local_path:
+                    self.logger.warning(f"Failed to download feedback file '{file_obj['name']}', skipping")
+                    continue
 
+                feedback_data = self.ai.procesar_feedback_pdf(local_path)
+                try: os.remove(local_path)
+                except: pass
 
-        local_path = descargar_archivo(file_url, file_obj["name"], TEMP_FOLDER)
-        if not local_path: return
+                if not feedback_data:
+                    self.logger.warning(f"AI returned no data for '{file_obj['name']}', skipping")
+                    continue
 
+                cand_name_ia = feedback_data["candidate_name"]
+                cand_db, _ = self.supa.resolver_identidad_candidato(None, cand_name_ia)
 
+                if not cand_db:
+                    self.logger.warning(f"Candidato '{cand_name_ia}' no encontrado para feedback")
+                    continue
 
-        feedback_data = self.ai.procesar_feedback_pdf(local_path)
-        try: os.remove(local_path)
-        except: pass
+                res_app = self.supa.client.table("NzymeRecruitingApplications")\
+                    .select("notion_page_id, current_stage")\
+                    .eq("candidate_id", cand_db["id"])\
+                    .eq("process_id", process_context["id"])\
+                    .execute()
 
+                if not res_app.data:
+                    self.logger.warning(f"No application found for '{cand_name_ia}' in process {process_context['id']}")
+                    continue
 
+                app_data = res_app.data[0]
+                target_id = app_data["notion_page_id"]
+                current_stage = app_data.get("current_stage")
 
-        if not feedback_data:
-            return
+                gathered_db_id = self.notion.find_child_database(target_id, "Gathered Feedback")
+                if not gathered_db_id:
+                    self.logger.warning(f"No 'Gathered Feedback' DB found for '{cand_name_ia}'")
+                    continue
 
-
-
-        cand_name_ia = feedback_data["candidate_name"]
-
-
-        cand_db, _ = self.supa.resolver_identidad_candidato(None, cand_name_ia)
-
-
-
-        if not cand_db:
-            self.logger.warning(f"Candidato '{cand_name_ia}' no encontrado para feedback")
-            return
-
-
-
-        try:
-            res_app = self.supa.client.table("NzymeRecruitingApplications")\
-                .select("notion_page_id, current_stage")\
-                .eq("candidate_id", cand_db["id"])\
-                .eq("process_id", process_context["id"])\
-                .execute()
-
-
-            if not res_app.data:
-                return
-
-
-            app_data = res_app.data[0]
-            target_id = app_data["notion_page_id"]
-            current_stage = app_data.get("current_stage")
-
-
-
-        except Exception as e:
-            self.logger.error(f"Error buscando aplicación: {e}")
-            return
-
-
-
-        gathered_db_id = self.notion.find_child_database(target_id, "Gathered Feedback")
-
-
-        if gathered_db_id:
-            payload = {
-                "Interviewer": {"title": [{"text": {"content": f"{interviewer_name} - {current_stage}" if current_stage else interviewer_name}}]},
-            }
-            if current_stage: 
-                payload["Stage"] = {"select": {"name": current_stage}}
-
-
-            res_create = self.notion.create_page(gathered_db_id, payload)
-
-
-            if res_create.status_code == 200:
-                new_page_id = res_create.json()["id"]
-                bloque_texto = {
-                    "object": "block", "type": "paragraph",
-                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": feedback_data["feedback_text"][:2000]}}]}
+                payload = {
+                    "Interviewer": {"title": [{"text": {"content": f"{interviewer_name} - {current_stage}" if current_stage else interviewer_name}}]},
                 }
-                self.notion.append_block_children(new_page_id, [bloque_texto])
+                if current_stage:
+                    payload["Stage"] = {"select": {"name": current_stage}}
 
+                res_create = self.notion.create_page(gathered_db_id, payload)
 
-                self.notion.update_page(form_id, {"Processed": {"checkbox": True}})
-                self.logger.info(f"Feedback sincronizado para '{cand_name_ia}'")
-            else:
-                self.logger.error(f"Error creando nota en Notion: {res_create.text}")
+                if res_create.status_code == 200:
+                    new_page_id = res_create.json()["id"]
+                    blocks = markdown_to_notion_blocks(feedback_data["feedback_markdown"])
+                    self.logger.info(f"Feedback: {len(blocks)} blocks generated for '{cand_name_ia}'")
+
+                    CHUNK_SIZE = 100
+                    for i in range(0, len(blocks), CHUNK_SIZE):
+                        chunk = blocks[i:i + CHUNK_SIZE]
+                        self.notion.append_block_children(new_page_id, chunk)
+
+                    self.logger.info(f"Feedback sincronizado para '{cand_name_ia}'")
+                else:
+                    self.logger.error(f"Error creando nota en Notion: {res_create.text}")
+
+            except Exception as e:
+                self.logger.error(f"Error processing feedback file '{file_obj.get('name', '?')}': {e}", exc_info=True)
+
+        self.notion.update_page(form_id, {"Processed": {"checkbox": True}})
 
 
 
@@ -407,6 +398,11 @@ class Observer:
             self.logger.error(f"Error buscando apps: {e}")
             return
 
+        # Backfill email if candidate was matched by name but had no email
+        should_backfill = cand_email and not cand_db.get("email")
+        if should_backfill:
+            self._backfill_candidate_email(cand_db, cand_email, app_page_ids)
+
 
 
         if not app_page_ids: return
@@ -420,13 +416,12 @@ class Observer:
                 rel_payload = [{"name": r, "color": "default"} for r in rel_list]
                 payload = {
                     "Referrer Name": {"title": [{"text": {"content": ref_name}}]},
-                    "Candidate Email": {"email": cand_email} if cand_email else None,
                     "Referrer Email": {"email": ref_email} if ref_email else None,
                     "Referrer Phone": {"phone_number": ref_phone} if ref_phone else None,
                     "Context": {"rich_text": [{"text": {"content": context}}]},
                     "Relationship to Candidate": {"multi_select": rel_payload} if rel_payload else None,
                     "Timing of such relationship": {"select": {"name": timing_val, "color": "default"}} if timing_val else None,
-                    "Reference Outcome": {"select": {"name": outcome_val, "color": "default"}}
+                    "Reference Outcome": {"select": {"name": "To contact", "color": "default"}}
                 }
                 payload = {k: v for k, v in payload.items() if v is not None}
                 res = self.notion.create_page(child_db_id, payload)
@@ -468,7 +463,10 @@ class Observer:
         self.logger.info(f"Outcome match: '{outcome_val}' -> '{final_stage_name}'")
 
 
-        payload_cand = {"Stage": {"select": {"name": final_stage_name}}}
+        payload_cand = {
+            "Stage": {"select": {"name": final_stage_name}},
+            PROP_NEXT_STEPS: {"multi_select": []}  # Clear next steps on disqualification
+        }
         res_upd = self.notion.update_page(candidate_id, payload_cand)
 
         if res_upd.status_code == 200:
@@ -531,15 +529,71 @@ class Observer:
 
 
         payload = NotionBuilder.build_candidate_payload(
-            datos_ia, public_url, curr_proc, 
+            datos_ia, public_url, curr_proc,
             existing_history=curr_hist, existing_team_role=curr_role
         )
 
-
+        payload[PROP_CHECKBOX_PROCESSED] = {"checkbox": True}
         self.notion.update_page(page["id"], payload)
         self.logger.info("Enriquecimiento completado")
         return True
-    
+
+    def _logic_enrich_linkedin(self, page):
+        """Enrich candidate from LinkedIn profile when no CV is available."""
+        props = page["properties"]
+        linkedin_url = props.get(PROP_LINKEDIN, {}).get("url")
+        if not linkedin_url:
+            return False
+
+        if not self.exa:
+            return False
+
+        self.logger.info(f"Trying LinkedIn enrichment for: {linkedin_url}")
+
+        try:
+            linkedin_text = self.exa.get_linkedin_profile(linkedin_url)
+            if not linkedin_text:
+                return False
+
+            datos_ia = self.ai.procesar_linkedin(linkedin_text)
+            if not datos_ia:
+                return False
+
+            # Preserve existing page values the AI won't have
+            datos_ia["linkedin_url"] = linkedin_url
+            if not datos_ia.get("email"):
+                datos_ia["email"] = props.get(PROP_EMAIL, {}).get("email")
+            if not datos_ia.get("phone"):
+                datos_ia["phone"] = props.get(PROP_PHONE, {}).get("phone_number")
+
+            # Read existing process history and team role
+            curr_hist = [t["name"] for t in props.get("Process History", {}).get("multi_select", [])]
+            curr_role = [t["name"] for t in props.get("Proposed Nzyme Team & Role", {}).get("multi_select", [])]
+            curr_proc_obj = props.get("Last Process Involved in", {}).get("select")
+            curr_proc = curr_proc_obj["name"] if curr_proc_obj else "Referral/General"
+
+            # Build and apply Notion payload (no CV file URL)
+            payload = NotionBuilder.build_candidate_payload(
+                datos_ia, None, curr_proc,
+                existing_history=curr_hist, existing_team_role=curr_role
+            )
+            # Don't overwrite these — referral form already sets them
+            payload.pop(PROP_PROCESS_HISTORY, None)
+            payload.pop(PROP_TEAM_ROLE, None)
+            payload[PROP_CHECKBOX_PROCESSED] = {"checkbox": True}
+            self.notion.update_page(page["id"], payload)
+
+            # Sync to Supabase
+            supa_data = DomainMapper.map_to_supabase_candidate(datos_ia, None)
+            self.supa.gestion_candidato(supa_data, page["id"])
+
+            self.logger.info("LinkedIn enrichment completed")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"LinkedIn enrichment failed: {e}", exc_info=True)
+            return False
+
     def _logic_dispatch_candidate_to_form(self, candidate_page, process_dashboard_page_id):
         """
         Mueve un candidato de Main DB al Formulario destino.
@@ -568,9 +622,7 @@ class Observer:
             val_cv_url = file_data.get("external", {}).get("url") or file_data.get("file", {}).get("url")
 
         if not val_cv_url:
-            self.logger.warning(f"[DISPATCH] El candidato '{val_name}' no tiene CV. Cancelando.")
-            self.notion.update_page(cand_id, {"Assign to Active Process": {"relation": []}})
-            return
+            self.logger.info(f"[DISPATCH] Candidato '{val_name}' no tiene CV. Enviando sin CV.")
 
         # --- B. RESOLUCIÓN DE DESTINO ---
         try:
@@ -638,7 +690,7 @@ class Observer:
             if val_linkedin and PROP_LINKEDIN in valid_cols:
                 payload[PROP_LINKEDIN] = {"url": val_linkedin}
 
-            if PROP_CV_FILES in valid_cols:
+            if val_cv_url and PROP_CV_FILES in valid_cols:
                 payload[PROP_CV_FILES] = {
                     "files": [{
                         "name": val_cv_name, 
@@ -768,6 +820,37 @@ class Observer:
                 if partial_text in opt["name"]: return opt["name"]
         except: pass
         return partial_text
+
+    def _backfill_candidate_email(self, cand_db: dict, new_email: str, app_page_ids: list):
+        """
+        Backfills email when candidate was matched by name but had no email on file.
+        Updates: Supabase, Notion Main DB, all active workflow pages.
+        """
+        candidate_id = cand_db["id"]
+        main_notion_id = cand_db.get("notion_page_id")
+
+        # 1. Update Supabase
+        self.supa.update_candidate_email(candidate_id, new_email)
+
+        # 2. Update Notion Main DB
+        if main_notion_id:
+            try:
+                self.notion.update_page(main_notion_id, {
+                    PROP_EMAIL: {"email": new_email}
+                })
+            except Exception as e:
+                self.logger.error(f"Error updating Main DB email: {e}")
+
+        # 3. Update all active workflow pages
+        for app_pid in app_page_ids:
+            try:
+                self.notion.update_page(app_pid, {
+                    PROP_EMAIL: {"email": new_email}
+                })
+            except Exception as e:
+                self.logger.error(f"Error updating workflow page email: {e}")
+
+        self.logger.info(f"Email backfilled for '{cand_db.get('name')}': {new_email}")
     # =========================================================================
     # 4. EJECUCIÓN PRINCIPAL (ORQUESTADOR)
     # =========================================================================
@@ -806,7 +889,12 @@ if __name__ == "__main__":
     st_client = StorageClient()
     ai_agent = AnalizadorCV()
 
+    exa = None
+    try:
+        from core.exa_client import ExaClient
+        exa = ExaClient()
+    except (ValueError, ImportError) as e:
+        print(f"ExaClient not available: {e}. LinkedIn enrichment disabled.")
 
-
-    obs = Observer(n_client, s_client, st_client, ai_agent)
+    obs = Observer(n_client, s_client, st_client, ai_agent, exa_client=exa)
     obs.run_once()

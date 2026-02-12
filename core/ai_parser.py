@@ -36,6 +36,14 @@ class ExperienceBreakdown(BaseModel):
     # Portfolio Roles
     portco_roles: SectorExperience = Field(description="C-Level/Management roles in companies explicitly owned by PE funds.")
 
+    # Corporate Functions
+    finance: SectorExperience = Field(description="Finance roles at companies (CFO, Controller, FP&A, Treasury).")
+    marketing: SectorExperience = Field(description="Marketing roles at companies (CMO, Brand, Growth, Digital Marketing).")
+    operations: SectorExperience = Field(description="Operations roles at companies (COO, Supply Chain, Logistics, Manufacturing).")
+    product: SectorExperience = Field(description="Product roles at companies (CPO, Product Manager, Product Owner).")
+    sales_revenue: SectorExperience = Field(description="Sales/Revenue roles at companies (CRO, Sales Director, Account Executive, Business Development).")
+    technology: SectorExperience = Field(description="Technology roles at companies (CTO, VP Engineering, Software Engineer, IT Director).")
+
 class GeneralData(BaseModel):
     international_locations: List[str] = Field(description="List of countries where candidate LIVED & WORKED > 6 months. Exclude deal locations.")
     industries_specialized: List[str] = Field(description="Industries where candidate held MANAGEMENT roles (Real companies). Exclude industries they only advised as a consultant. Generic category only (e.g., 'Tech', 'Energy', 'Healthcare').")
@@ -68,12 +76,12 @@ class CVData(BaseModel):
     experience: ExperienceBreakdown
     general: GeneralData
     languages: List[str] = Field(description="Language names only.")
-    strategic_assessment: List[AssessmentItem] = Field(description="List of 13 strategic evaluations based on the provided definitions.")
+    strategic_assessment: List[AssessmentItem] = Field(description="List of strategic evaluations based on the provided definitions. Return empty list if no definitions provided.")
 
-# --- NUEVO MODELO PARA FEEDBACK ---
-class FeedbackData(BaseModel):
-    candidate_name: str = Field(description="The full name of the candidate being evaluated. Look for 'Candidate:', 'Name:', or the header.")
-    feedback_text: str = Field(description="The qualitative feedback content. Summarize the interviewer's opinion, strengths, and weaknesses. Exclude boilerplate text, confidential disclaimers, logos, or dates.")
+# --- MODELO PARA FEEDBACK (Markdown output) ---
+class FeedbackResponse(BaseModel):
+    candidate_name: str = Field(description="Full name of the candidate. Look for 'Candidate:', 'Name:', or the header.")
+    feedback_markdown: str = Field(description="The entire feedback converted to clean Markdown. Use ## for sections, - for bullets, **bold** for emphasis. Convert tables to bullet summaries like '- **Category**: Value'. Preserve ALL content — do NOT summarize or omit anything.")
 
 # --- CLASE PRINCIPAL ---
 
@@ -97,32 +105,51 @@ class AnalizadorCV:
             print(f"   [IA ERROR] Leyendo PDF: {e}")
             return None
 
-    def procesar_cv(self, ruta_archivo):
-        print("      -> Analizando CV con IA (+ Strategic Assessment)...")
+    def procesar_cv(self, ruta_archivo, matrix_characteristics=None):
+        """
+        Args:
+            ruta_archivo: Path to CV file
+            matrix_characteristics: Optional list of dicts with 'characteristic' and 'definition'.
+                                   If None, skip strategic assessment entirely.
+        """
+        print("      -> Analizando CV con IA...")
         texto_cv = self._leer_pdf(ruta_archivo)
         if not texto_cv: return None
 
-        texto_cv = texto_cv[:25000] # Aumentado ligeramente para dar cabida a CVs largos
+        texto_cv = texto_cv[:25000]
 
-        # Definiciones estratégicas (Hardcoded para consistencia)
-        strat_definitions = """
-        1. Analogous Industry Dynamics: Experience in an industry with similar mechanics to the PortCo.
-        2. Analogous Company Dynamics: Experience in a company with similar characteristics to the PortCo (size, ownership, history, needs).
-        3. Prior CEO Role (PE-Backed): Experience as CEO within a Private Equity-backed environment.
-        4. Prior CEO Role (Not PE-Backed): Experience as CEO but not within the Private Equity ecosystem.
-        5. General Management Position (PE-Backed): Experience in top executive/leadership roles in a sponsor-owned company.
-        6. General Management Position (Not PE-Backed): Top executive roles not within the PE ecosystem.
-        7. Prior role in a PE-Backed company: Working for a sponsor-owned company but not in C-level role.
-        8. Decision-Making Track Record: Experience making high-stake decisions and proof of having learned from consequences.
-        9. Full P&L Responsibility: Experience managing a complete Profit & Loss statement.
-        10. Corporate Transformation: Experience in complex corporate transformations or leading transformational initiatives.
-        11. Build-ups or M&A: Experience conducting build-ups or M&A and/or integrations.
-        12. Margin & Working Capital Mgmt.: Experience in optimizing financial margins and liquidity.
-        13. Processes/ERP Implementation: Experience in process optimization/implementation and ERP deployment.
+        # Build dynamic strat_definitions based on matrix_characteristics
+        if matrix_characteristics:
+            strat_definitions = "\n".join(
+                f"{i+1}. {item['characteristic']}: {item['definition']}"
+                for i, item in enumerate(matrix_characteristics)
+            )
+            num_items = len(matrix_characteristics)
+            assessment_instruction = f"""
+        ### STRATEGIC ASSESSMENT INSTRUCTIONS
+        Evaluate the candidate against the following {num_items} characteristics using the definitions below.
+        For EACH characteristic, provide:
+        - **Score**: High, Medium, Low, or No.
+        - **Comment**: A very brief justification.
+
+        DEFINITIONS:
+        {strat_definitions}
+
+        ### OUTPUT
+        Extract strictly into the JSON schema provided. Ensure 'strategic_assessment' contains exactly {num_items} items corresponding to the list above.
+        """
+        else:
+            assessment_instruction = """
+        ### STRATEGIC ASSESSMENT
+        No strategic characteristics configured for this process.
+        Return an empty list for 'strategic_assessment'.
+
+        ### OUTPUT
+        Extract strictly into the JSON schema provided.
         """
 
         prompt_system = f"""
-        You are an elite Headhunter data entry specialist. Your job is to extract data from CVs and perform a Strategic Assessment.
+        You are an elite Headhunter data entry specialist. Your job is to extract data from CVs.
 
         ### CAPITALIZATION & CLEANING RULES (Apply to ALL text fields)
         1. **Title Case**: Always convert names to standard business casing.
@@ -136,18 +163,7 @@ class AnalizadorCV:
         ### EDUCATION RULES
         1. **Simplification**: Map degrees to 'Engineering', 'Law', 'Economics', 'Business', 'Science', 'Humanities'.
         2. **MBA**: Extract School Name or "No".
-
-        ### STRATEGIC ASSESSMENT INSTRUCTIONS
-        Evaluate the candidate against the following 13 characteristics using the definitions below.
-        For EACH characteristic, provide:
-        - **Score**: High, Medium, Low, or No.
-        - **Comment**: A very brief justification.
-        
-        DEFINITIONS:
-        {strat_definitions}
-
-        ### OUTPUT
-        Extract strictly into the JSON schema provided. Ensure 'strategic_assessment' contains exactly 13 items corresponding to the list above.
+        {assessment_instruction}
         """
 
         try:
@@ -165,27 +181,126 @@ class AnalizadorCV:
             print(f"   [IA ERROR] OpenAI: {e}")
             return None
 
-    # --- NUEVO MÉTODO DE FEEDBACK ---
+    def procesar_linkedin(self, linkedin_text: str, matrix_characteristics=None):
+        """
+        Parses LinkedIn profile markdown text (from Exa) into structured CVData.
+
+        Args:
+            linkedin_text: Raw markdown text of the LinkedIn profile.
+            matrix_characteristics: Optional list of dicts with 'characteristic' and 'definition'.
+        """
+        print("      -> Analizando perfil LinkedIn con IA...")
+        if not linkedin_text:
+            return None
+
+        linkedin_text = linkedin_text[:25000]
+
+        # Build strategic assessment instruction (same logic as procesar_cv)
+        if matrix_characteristics:
+            strat_definitions = "\n".join(
+                f"{i+1}. {item['characteristic']}: {item['definition']}"
+                for i, item in enumerate(matrix_characteristics)
+            )
+            num_items = len(matrix_characteristics)
+            assessment_instruction = f"""
+        ### STRATEGIC ASSESSMENT INSTRUCTIONS
+        Evaluate the candidate against the following {num_items} characteristics using the definitions below.
+        For EACH characteristic, provide:
+        - **Score**: High, Medium, Low, or No.
+        - **Comment**: A very brief justification.
+
+        DEFINITIONS:
+        {strat_definitions}
+
+        ### OUTPUT
+        Extract strictly into the JSON schema provided. Ensure 'strategic_assessment' contains exactly {num_items} items corresponding to the list above.
+        """
+        else:
+            assessment_instruction = """
+        ### STRATEGIC ASSESSMENT
+        No strategic characteristics configured for this process.
+        Return an empty list for 'strategic_assessment'.
+
+        ### OUTPUT
+        Extract strictly into the JSON schema provided.
+        """
+
+        prompt_system = f"""
+        You are an elite Headhunter data entry specialist. Your job is to extract structured candidate data from a LinkedIn profile.
+
+        ### INPUT FORMAT
+        The input is a LinkedIn profile converted to markdown. It may contain sections like:
+        Experience, Education, Skills, Languages, About, Activity, Recommendations, Licenses & Certifications.
+        Use ALL sections — any section may contain useful career context.
+
+        ### CONTACT INFO RULES
+        - Set email to null — LinkedIn rarely shows emails, and the candidate's contact info is already captured from the form.
+        - Set phone to null — same reason.
+        - Set linkedin_url to null — the URL is already known from the form data.
+
+        ### CAPITALIZATION & CLEANING RULES (Apply to ALL text fields)
+        1. **Title Case**: Always convert names to standard business casing.
+        2. **Clean Names**: Remove legal suffixes (Ltd, Inc, S.A).
+
+        ### EXPERIENCE RULES (The Golden Rules)
+        1. **Management**: Include ONLY real companies. NEVER Consulting firms/Big4/Banks.
+        2. **PE PortCo**: Only if explicitly stated as PE Portfolio Company.
+        3. **International**: LIVED and WORKED > 6 months.
+        4. **Date Calculation**: LinkedIn uses formats like "Jan 2020 - Present", "2018 - 2021", "Mar 2015 - Dec 2019". Calculate durations accurately. "Present" means the role is current.
+
+        ### EDUCATION RULES
+        1. **Simplification**: Map degrees to 'Engineering', 'Law', 'Economics', 'Business', 'Science', 'Humanities'.
+        2. **MBA**: Extract School Name or "No".
+        {assessment_instruction}
+        """
+
+        try:
+            completion = self.client.beta.chat.completions.parse(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": prompt_system},
+                    {"role": "user", "content": f"LinkedIn Profile:\n{linkedin_text}"},
+                ],
+                response_format=CVData,
+            )
+            return completion.choices[0].message.parsed.model_dump()
+
+        except Exception as e:
+            print(f"   [IA ERROR] OpenAI LinkedIn: {e}")
+            return None
+
+    # --- FEEDBACK PDF → MARKDOWN ---
     def procesar_feedback_pdf(self, ruta_archivo):
         print("      -> Analizando Feedback con IA...")
         texto_pdf = self._leer_pdf(ruta_archivo)
         if not texto_pdf: return None
-        
-        # Recortamos por si es muy largo, pero el feedback suele ser corto
-        texto_pdf = texto_pdf[:15000]
+
+        texto_pdf = texto_pdf[:50000]
 
         prompt_system = """
-        You are an assistant for a Recruiting Agency. You will receive a PDF text containing interview feedback from a Headhunter or external interviewer.
-        
-        Your Goal:
-        1. Identify the **Candidate Name** mentioned in the document. It is usually at the top or in a field labeled "Candidate".
-        2. Extract the **Feedback Body**. This is the qualitative evaluation, strengths, weaknesses, and comments. 
-        
-        Constraints:
-        - IGNORE headers, footers, logos, company addresses, or confidential disclaimers.
-        - IGNORE the name of the interviewer or the date, unless it's part of the narrative.
-        - Return the candidate name in Title Case.
-        - Keep the feedback text clean but preserve the original meaning and structure (bullet points are fine).
+        You receive raw text extracted from an executive search candidate report PDF. The text may be messy due to PDF extraction — columns may be interleaved, tables may be flattened, and sections may be out of order.
+
+        Your job:
+        1. Identify the **Candidate Name** (usually at the top). Return it in Title Case.
+        2. Reformat the entire document into clean Markdown ready to paste into Notion.
+
+        Formatting rules:
+        - Use # for the candidate name as page title.
+        - Use ## for major sections (e.g., Resumen, Trayectoria Profesional, Educación, etc.).
+        - Use ### for subsections (e.g., individual roles within a company).
+        - Reconstruct any tables (like fit/scorecard assessments) as proper Markdown tables using | Column | Column | syntax. Notion renders these natively.
+        - Group related fields logically even if the PDF extraction scrambled them (e.g., keep all summary fields together, all compensation fields together).
+        - Use **bold** for field labels followed by their values on the same line.
+        - Use bullet points only for actual lists, not for key-value pairs.
+        - Use --- between major sections.
+        - For career history, nest roles under their parent company using ### for the company/period and #### for individual roles.
+
+        Critical constraints:
+        - Preserve ALL content. Do NOT summarize, shorten, or omit anything.
+        - IGNORE headers, footers, page numbers, logos, and repeated candidate name/position footers.
+        - IGNORE the search firm's contact details (emails, phones of the firm — NOT the candidate's).
+        - Keep the original language of the document.
+        - Output ONLY valid Markdown in the feedback_markdown field.
         """
 
         try:
@@ -195,7 +310,7 @@ class AnalizadorCV:
                     {"role": "system", "content": prompt_system},
                     {"role": "user", "content": f"Document Content:\n{texto_pdf}"},
                 ],
-                response_format=FeedbackData,
+                response_format=FeedbackResponse,
             )
             return completion.choices[0].message.parsed.model_dump()
 

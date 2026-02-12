@@ -47,7 +47,7 @@ class DomainMapper:
         }
 
     @staticmethod
-    def map_to_supabase_candidate(ai_data, public_cv_url):
+    def map_to_supabase_candidate(ai_data, public_cv_url, source=None):
         """
         Prepara el diccionario híbrido para Supabase.
         Combina columnas SQL nuevas y transforma el JSON para que quede limpio.
@@ -58,8 +58,9 @@ class DomainMapper:
             "email": ai_data.get("email"),
             "phone": ai_data.get("phone"),
             "linkedin_url": ai_data.get("linkedin_url"), # Ojo: key suele ser linkedin_url en el modelo IA
-            "cv_url": public_cv_url, 
-            "assessment": None
+            "cv_url": public_cv_url,
+            "assessment": None,
+            "source": source
         }
 
         # Extraemos el bloque de experiencia crudo para procesarlo
@@ -106,6 +107,12 @@ class DomainMapper:
                 "management": DomainMapper._format_experience(raw_exp.get("management")),
                 "corp_ma": DomainMapper._format_experience(raw_exp.get("corp_ma")),
                 "portco_roles": DomainMapper._format_experience(raw_exp.get("portco_roles")),
+                "finance": DomainMapper._format_experience(raw_exp.get("finance")),
+                "marketing": DomainMapper._format_experience(raw_exp.get("marketing")),
+                "operations": DomainMapper._format_experience(raw_exp.get("operations")),
+                "product": DomainMapper._format_experience(raw_exp.get("product")),
+                "sales_revenue": DomainMapper._format_experience(raw_exp.get("sales_revenue")),
+                "technology": DomainMapper._format_experience(raw_exp.get("technology")),
             }
         }
 

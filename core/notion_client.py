@@ -44,10 +44,10 @@ class NotionClient:
         """Adds child blocks to a parent block."""
         url = f"{self.base_url}/blocks/{block_id}/children"
         payload = {"children": children}
-        
+
         if after:
             payload["after"] = after
-        
+
         response = requests.patch(url, headers=self.headers, json=payload)
         return response
 
@@ -97,23 +97,25 @@ class NotionClient:
 
     def create_page(self, database_id, properties):
         """
-        Creates a page in a DB. 
+        Creates a page in a DB.
         Automatically detects whether we need to use the data_source_id or database_id.
         """
         # Try to resolve the Data Source ID first
         ds_id = self.get_data_source_id(database_id)
         target_id = ds_id if ds_id else database_id
-        
+
         url = f"{self.base_url}/pages"
-        
+
         # Dynamic parent structure
         parent_struct = {
             "type": "data_source_id" if ds_id else "database_id",
             "data_source_id" if ds_id else "database_id": target_id
         }
-        
+
         payload = {"parent": parent_struct, "properties": properties}
+
         response = requests.post(url, headers=self.headers, json=payload)
+
         return response
 
 

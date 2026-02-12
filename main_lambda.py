@@ -74,8 +74,15 @@ def lambda_handler(event, context):
             s_client = SupabaseManager()
             st_client = StorageClient()
             ai_agent = AnalizadorCV()
-            
-            bot = HarvesterRelational(n_client, s_client, st_client, ai_agent)
+
+            exa = None
+            try:
+                from core.exa_client import ExaClient
+                exa = ExaClient()
+            except (ValueError, ImportError) as e:
+                logger.warning(f"ExaClient not available: {e}. LinkedIn enrichment disabled.")
+
+            bot = HarvesterRelational(n_client, s_client, st_client, ai_agent, exa_client=exa)
             bot.run_once()
             return {"statusCode": 200, "body": "Harvester executed successfully"}
 
@@ -86,8 +93,15 @@ def lambda_handler(event, context):
             s_client = SupabaseManager()
             st_client = StorageClient()
             ai_agent = AnalizadorCV()
-            
-            obs = Observer(n_client, s_client, st_client, ai_agent)
+
+            exa = None
+            try:
+                from core.exa_client import ExaClient
+                exa = ExaClient()
+            except (ValueError, ImportError) as e:
+                logger.warning(f"ExaClient not available: {e}. LinkedIn enrichment disabled.")
+
+            obs = Observer(n_client, s_client, st_client, ai_agent, exa_client=exa)
             obs.run_once()
             return {"statusCode": 200, "body": "Observer executed successfully"}
 

@@ -5,3 +5,4 @@ pydantic
 pdfplumber
 supabase
 logfire[openai]
+exa-py

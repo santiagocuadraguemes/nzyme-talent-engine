@@ -1,6 +1,7 @@
 # core/supabase_client.py
 
 import os
+import unicodedata
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from core.logger import get_logger # <--- Logger integration
@@ -20,7 +21,7 @@ class SupabaseManager:
 
 
     # --- PROCESS MANAGEMENT ---
-    def registrar_proceso(self, notion_wf_id, notion_form_id, bulk_id, feedback_id, nombre, tipo):
+    def registrar_proceso(self, notion_wf_id, notion_form_id, bulk_id, feedback_id, nombre, tipo, matrix_characteristics=None):
         data = {
             "notion_workflow_id": notion_wf_id,
             "notion_form_id": notion_form_id,
@@ -28,7 +29,8 @@ class SupabaseManager:
             "notion_feedback_id": feedback_id,
             "process_name": nombre,
             "process_type": tipo,
-            "status": "Open"
+            "status": "Open",
+            "matrix_characteristics": matrix_characteristics
         }
         try:
             self.client.table("NzymeRecruitingProcesses").insert(data).execute()
@@ -109,6 +111,9 @@ class SupabaseManager:
             if existing.data:
                 # C. UPDATE (Already exists)
                 cid = existing.data[0]['id']
+                # Don't overwrite source with None for existing candidates
+                if payload.get("source") is None:
+                    del payload["source"]
                 self.client.table("NzymeTalentNetwork").update(payload).eq("id", cid).execute()
                 return cid
             else:
@@ -322,24 +327,64 @@ class SupabaseManager:
 
         # 2. SEARCH BY NAME (If no match by email)
         if name_clean:
+            # 2a. Try exact (case-insensitive) match first
             res = self.client.table("NzymeTalentNetwork").select("*").ilike("name", name_clean).execute()
-            
+
+            # 2b. If no exact match, try accent-insensitive fuzzy search
+            if not res.data:
+                res.data = self._fuzzy_name_search(name_clean)
+
             if res.data:
                 potential_match = res.data[0]
                 db_email = potential_match.get("email")
-                
+
                 # RULE 1: If I bring email, and DB has a DIFFERENT email -> THEY ARE NOT THE SAME.
                 if email_clean and db_email and email_clean != db_email.lower():
                     self.logger.info("Conflicto de identidad: Mismo nombre, distintos emails. Se trata como NUEVO.")
                     return None, None
-                
+
                 # RULE 2: I don't bring email, DB has email -> THEY ARE THE SAME (Merge).
                 # RULE 3: I bring email, DB doesn't have email -> THEY ARE THE SAME (Merge).
                 # RULE 4: Neither has email -> THEY ARE THE SAME (Merge).
-                
+
                 return potential_match, potential_match.get("notion_page_id")
 
         return None, None
+
+    @staticmethod
+    def _normalize_name(name):
+        """Strip accents and lowercase: 'Avelló' -> 'avello', 'Peña' -> 'pena'."""
+        nfkd = unicodedata.normalize("NFKD", name)
+        return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
+
+    def _fuzzy_name_search(self, input_name):
+        """
+        Accent-insensitive name search. Searches by first name token in DB,
+        then compares normalized (unaccented) full names in Python.
+        """
+        tokens = input_name.split()
+        if not tokens:
+            return []
+
+        # Search by first name token (broadest useful filter)
+        first_token = tokens[0]
+        res = self.client.table("NzymeTalentNetwork").select("*").ilike("name", f"{first_token}%").execute()
+        if not res.data:
+            return []
+
+        input_normalized = self._normalize_name(input_name)
+
+        # Compare normalized names — match if one contains the other
+        # (handles "Gonzaga Avello" matching "Gonzaga Avelló De La Peña")
+        matches = []
+        for row in res.data:
+            db_normalized = self._normalize_name(row.get("name", ""))
+            if db_normalized == input_normalized:
+                return [row]  # Exact normalized match — best result
+            if db_normalized.startswith(input_normalized) or input_normalized.startswith(db_normalized):
+                matches.append(row)
+
+        return matches[:1]  # Return at most one match
     
     def obtener_proceso_por_nombre(self, process_name):
         """
@@ -355,7 +400,7 @@ class SupabaseManager:
 
             if response.data and len(response.data) > 0:
                 return response.data[0]
-            
+
             return None
 
 
@@ -363,3 +408,20 @@ class SupabaseManager:
             # In production you could use self.logger.error if you have injected logger
             print(f"[Supabase] Error buscando proceso por nombre '{process_name}': {e}")
             return None
+
+    def update_candidate_email(self, candidate_id: str, new_email: str) -> bool:
+        """
+        Updates candidate email in SQL column.
+        Used for backfilling email when candidate was matched by name.
+        Returns True on success.
+        """
+        try:
+            self.client.table("NzymeTalentNetwork")\
+                .update({"email": new_email, "updated_at": "now()"})\
+                .eq("id", candidate_id)\
+                .execute()
+            self.logger.info(f"Email updated for candidate {candidate_id}: {new_email}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error updating candidate email: {e}")
+            return False

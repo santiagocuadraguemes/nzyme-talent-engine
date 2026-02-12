@@ -1,5 +1,6 @@
 # core/guidelines_parser.py
 
+import copy
 import os
 import re
 from core.notion_client import NotionClient
@@ -103,29 +104,63 @@ class GuidelinesParser:
 
 
 
+    def _sanitizar_bloque(self, bloque):
+        """
+        Remove read-only properties that Notion API rejects on create.
+        Preserves: object, type, and the type-specific data (with colors).
+        """
+        PROPS_READONLY = {
+            "id", "created_by", "created_time", "last_edited_by",
+            "last_edited_time", "parent", "archived", "in_trash",
+            "request_id", "has_children"
+        }
+        return {k: v for k, v in bloque.items() if k not in PROPS_READONLY}
+
+
+    def _sanitizar_rich_text(self, rich_text_obj):
+        """
+        Remove read-only properties from a rich text object.
+        Keeps: type, text, annotations, mention, equation
+        Removes: plain_text, href (read-only per Notion API docs)
+        """
+        PROPS_READONLY_RT = {"plain_text", "href"}
+        return {k: v for k, v in rich_text_obj.items() if k not in PROPS_READONLY_RT}
+
+
     def _procesar_lista_bloques(self, lista_bloques):
         """
         Recursive helper that clones blocks while cleaning read-only properties.
         """
         resultado = []
-        
+
         for b in lista_bloques:
             tipo = b["type"]
-            
+
             # 1. Ignore unsupported blocks
-            if tipo in ["child_page", "child_database", "link_to_page", "unsupported"]: 
+            if tipo in ["child_page", "child_database", "link_to_page", "unsupported"]:
                 continue
-            
+
             # 2. Get block data
             datos_bloque = b.get(tipo, {})
-            
+
             # 3. Build the new base block
             nuevo_bloque = {
                 "object": "block",
                 "type": tipo,
-                tipo: datos_bloque.copy() if isinstance(datos_bloque, dict) else {}
+                tipo: copy.deepcopy(datos_bloque) if isinstance(datos_bloque, dict) else {}
             }
-            
+
+            # 3.5 Sanitize: remove read-only properties from type data
+            if isinstance(nuevo_bloque[tipo], dict):
+                nuevo_bloque[tipo] = self._sanitizar_bloque(nuevo_bloque[tipo])
+
+            # 3.6 For table_row: sanitize each rich text object in cells
+            if tipo == "table_row" and "cells" in nuevo_bloque[tipo]:
+                nuevo_bloque[tipo]["cells"] = [
+                    [self._sanitizar_rich_text(rt) for rt in cell]
+                    for cell in nuevo_bloque[tipo]["cells"]
+                ]
+
             # 4. PROCESS CHILDREN RECURSIVELY
             if b.get("has_children"):
                 try:

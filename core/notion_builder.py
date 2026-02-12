@@ -59,7 +59,7 @@ class NotionBuilder:
     # --- MÉTODO PRINCIPAL DE CONSTRUCCIÓN ---
 
     @staticmethod
-    def build_candidate_payload(candidate_data, public_cv_url, process_name, existing_history=None, process_type=None, existing_team_role=None):
+    def build_candidate_payload(candidate_data, public_cv_url, process_name, existing_history=None, process_type=None, existing_team_role=None, source=None):
         """
         Construye el cuerpo de la petición para Crear/Actualizar pagina en Notion.
         """
@@ -84,20 +84,26 @@ class NotionBuilder:
             PROP_NAME: {"title": [{"text": {"content": candidate_data.get("name", "Unnamed")[:200]}}]},
             PROP_PHONE: {"phone_number": candidate_data.get("phone")},
             PROP_LINKEDIN: {"url": candidate_data.get("linkedin_url")},
-            PROP_CV_FILES: {"files": [{"name": "CV.pdf", "external": {"url": public_cv_url}}]},
-            
+
             # Auditoría
             PROP_DATE_ADDED: {"date": {"start": date.today().isoformat()}},
-            
-            
+
             # Clasificación (Usando constantes RENOMBRADAS/PLURALES)
             PROP_PROCESS_HISTORY: {"multi_select": history_tags},
             PROP_TEAM_ROLE: {"multi_select": team_role_tags}
         }
+
+        # CV file - only set if we have a URL
+        if public_cv_url:
+            props[PROP_CV_FILES] = {"files": [{"name": "CV.pdf", "external": {"url": public_cv_url}}]}
         
         # Email
         if candidate_data.get("email"):
             props[PROP_EMAIL] = {"email": candidate_data.get("email")}
+
+        # Source (only set for new candidates)
+        if source:
+            props[PROP_SOURCE] = {"rich_text": [{"text": {"content": source}}]}
 
         # Rango Total Años
         rango_total = DomainMapper.get_years_range_tag(candidate_data.get("total_years", 0))
@@ -117,7 +123,13 @@ class NotionBuilder:
             PROP_EXP_FOUNDER: exp.get("founder"),
             PROP_EXP_MANAGEMENT: exp.get("management"),
             PROP_EXP_CORP_MA: exp.get("corp_ma"),
-            PROP_EXP_PORTCO: exp.get("portco_roles") or exp.get("portco")
+            PROP_EXP_PORTCO: exp.get("portco_roles") or exp.get("portco"),
+            PROP_EXP_FINANCE: exp.get("finance"),
+            PROP_EXP_MARKETING: exp.get("marketing"),
+            PROP_EXP_OPERATIONS: exp.get("operations"),
+            PROP_EXP_PRODUCT: exp.get("product"),
+            PROP_EXP_SALES_REVENUE: exp.get("sales_revenue"),
+            PROP_EXP_TECHNOLOGY: exp.get("technology"),
         }
 
         for prop_name, data in sector_mapping.items():
