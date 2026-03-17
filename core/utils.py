@@ -1,28 +1,33 @@
 import os
-import requests
+import httpx
 import re
+from core.logger import get_logger
 
-def descargar_archivo(url, nombre_archivo, carpeta_destino="/tmp/temp_downloads"):
+logger = get_logger("Utils")
+
+def download_file(url, file_name, dest_folder="/tmp/temp_downloads"):
+    """Downloads a file from a URL to a temporary folder.
+    Cleans the file name to ensure filesystem compatibility.
     """
-    Descarga un archivo desde una URL a una carpeta temporal.
-    Limpia el nombre del archivo para asegurar compatibilidad con el sistema de archivos.
-    """
-    if not os.path.exists(carpeta_destino):
-        os.makedirs(carpeta_destino)
+    if not os.path.exists(dest_folder):
+        os.makedirs(dest_folder)
 
-    # Limpieza de nombre (alfanumérico, puntos, guiones y barras bajas)
-    clean_name = "".join([c for c in nombre_archivo if c.isalnum() or c in "._-"]).strip()
-    path = os.path.join(carpeta_destino, clean_name)
+    # Clean name (alphanumeric, dots, hyphens, underscores)
+    clean_name = "".join([c for c in file_name if c.isalnum() or c in "._-"]).strip()
+    path = os.path.join(dest_folder, clean_name)
 
+    logger.debug(f"download_file: fetching '{file_name}' to '{dest_folder}'")
     try:
-        with requests.get(url, stream=True) as r:
+        with httpx.stream("GET", url) as r:
             r.raise_for_status()
+            logger.debug(f"download_file: HTTP {r.status_code}, streaming to '{path}'")
+            total_bytes = 0
             with open(path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_bytes(chunk_size=8192):
                     f.write(chunk)
+                    total_bytes += len(chunk)
+        logger.debug(f"download_file: complete — {total_bytes} bytes written to '{path}'")
         return path
     except Exception as e:
-        # En un script real podrías pasar un logger aquí, pero un print
-        # o dejar que la excepción suba es suficiente para utilidades simples.
-        print(f"[ERROR UTIL] Fallo descargando {nombre_archivo}: {e}")
+        print(f"[ERROR UTIL] Failed to download {file_name}: {e}")
         return None

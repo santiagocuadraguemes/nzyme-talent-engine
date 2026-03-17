@@ -1,8 +1,8 @@
-requests
 python-dotenv
 openai
 pydantic
 pdfplumber
+python-docx
 supabase
 logfire[openai]
 exa-py

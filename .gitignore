@@ -12,8 +12,16 @@ env/
 
 # Carpetas temporales de tu script (para que no se suban los PDFs)
 temp_downloads/
+tmp/
+
+# Log files
+logs/
 
 # Archivos de sistema/editor
 .DS_Store
 .vscode/
 .claude/
+
+# Lambda build artifacts
+package/
+lambda.zip

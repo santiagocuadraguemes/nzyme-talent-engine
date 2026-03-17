@@ -1,13 +1,27 @@
 from core.domain_mapper import DomainMapper
-from core.constants import *
+from core.logger import get_logger
+from core.constants import (
+    PROP_NAME, PROP_EMAIL, PROP_PHONE, PROP_LINKEDIN, PROP_CV_FILES,
+    PROP_CREATOR, PROP_SOURCE, PROP_ASSESSMENT, PROP_PROCESS_HISTORY,
+    PROP_TEAM_ROLE, PROP_EXP_TOTAL_YEARS, PROP_LANGUAGES,
+    PROP_EXP_CONSULTING, PROP_EXP_AUDIT, PROP_EXP_IB, PROP_EXP_PE,
+    PROP_EXP_VC, PROP_EXP_ENGINEER, PROP_EXP_LAWYER, PROP_EXP_FOUNDER,
+    PROP_EXP_MANAGEMENT, PROP_EXP_CORP_MA, PROP_EXP_PORTCO,
+    PROP_EXP_INTERNATIONAL, PROP_EXP_INDUSTRIES,
+    PROP_EDU_BACHELORS, PROP_EDU_MASTERS, PROP_EDU_UNIVERSITIES,
+    PROP_EDU_MBAS,
+)
+
+logger = get_logger("NotionParser")
+
 
 class NotionParser:
-    
-    # --- HELPERS DE EXTRACCIÓN (Privados) ---
-    
+
+    # --- EXTRACTION HELPERS (Private) ---
+
     @staticmethod
     def _extract_tags(prop_data):
-        """Extrae lista de strings de propiedades Select o Multi-select."""
+        """Extracts list of strings from Select or Multi-select properties."""
         if not prop_data: return []
         if "multi_select" in prop_data:
             return [item["name"] for item in prop_data["multi_select"]]
@@ -17,7 +31,7 @@ class NotionParser:
 
     @staticmethod
     def _extract_text(prop_data):
-        """Extrae string de propiedades Title, Rich Text o Text."""
+        """Extracts string from Title, Rich Text or Text properties."""
         if not prop_data: return None
         if "rich_text" in prop_data:
             parts = prop_data["rich_text"]
@@ -33,13 +47,13 @@ class NotionParser:
         select = prop_data.get("select")
         return select["name"] if select else None
 
-    # --- MÉTODO PRINCIPAL DE PARSEO ---
+    # --- MAIN PARSING METHOD ---
 
     @staticmethod
     def parse_candidate_properties(notion_props):
         data = {}
         
-        # 1. CAMPOS SQL (Columnas de primera clase)
+        # 1. SQL FIELDS (First-class columns)
         raw_name = notion_props.get(PROP_NAME, {}).get("title", [])
         if raw_name: data["name"] = raw_name[0]["plain_text"]
         
@@ -52,13 +66,13 @@ class NotionParser:
         linkedin = notion_props.get(PROP_LINKEDIN, {}).get("url")
         data["linkedin_url"] = linkedin if linkedin else None
 
-        # --- NUEVOS CAMPOS SQL ---
-        
-        # Creator y Source son TEXTO en Notion
+        # --- NEW SQL FIELDS ---
+
+        # Creator and Source are TEXT in Notion
         data["creator"] = NotionParser._extract_text(notion_props.get(PROP_CREATOR))
         data["source"] = NotionParser._extract_text(notion_props.get(PROP_SOURCE))
         
-        # Assessment es TAG en Notion -> Lo convertimos a String para SQL
+        # Assessment is TAG in Notion -> Convert to String for SQL
         tags_assessment = NotionParser._extract_tags(notion_props.get(PROP_ASSESSMENT))
         data["assessment"] = ", ".join(tags_assessment) if tags_assessment else None
 
@@ -73,12 +87,12 @@ class NotionParser:
         else:
             data["cv_url"] = None
 
-        # 2. CAMPOS JSON (Flexible Data)
-        
+        # 2. JSON FIELDS (Flexible Data)
+
         process_history = NotionParser._extract_tags(notion_props.get(PROP_PROCESS_HISTORY))
         proposed_teams = NotionParser._extract_tags(notion_props.get(PROP_TEAM_ROLE))
-        
-        # Mapeo de columnas de Experiencia
+
+        # Experience column mapping
         exp_fields_map = {
             PROP_EXP_CONSULTING: "consulting",
             PROP_EXP_AUDIT: "audit",
@@ -100,7 +114,7 @@ class NotionParser:
             "total_years_range": NotionParser._extract_select_name(notion_props.get(PROP_EXP_TOTAL_YEARS)),
             "languages": NotionParser._extract_tags(notion_props.get(PROP_LANGUAGES)),
             
-            # Plurales
+            # Plural fields
             "recruiting_processes_history": process_history,
             "proposed_teams_roles": proposed_teams,
             
@@ -123,5 +137,9 @@ class NotionParser:
 
         data["candidate_data"] = candidate_data_json
         data["updated_at"] = "now()"
-        
+
+        present = [k for k, v in data.items() if v is not None and k != "updated_at"]
+        missing = [k for k, v in data.items() if v is None and k != "updated_at"]
+        logger.debug(f"Parsed candidate props — present: {present}, missing: {missing}")
+
         return data

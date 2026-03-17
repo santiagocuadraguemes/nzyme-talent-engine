@@ -1,4 +1,7 @@
-from datetime import date
+from core.logger import get_logger
+
+logger = get_logger("DomainMapper")
+
 
 class DomainMapper:
     YEAR_TAGS = {
@@ -8,9 +11,9 @@ class DomainMapper:
 
     @staticmethod
     def get_years_range_tag(years_float):
-        """Calcula el rango de años basado en un número flotante."""
+        """Calculates the years range based on a float value."""
         y = years_float
-        if y is None or y <= 0: return "No" # Devolvemos "No" por defecto si es 0
+        if y is None or y <= 0: return "No"
         if y < 3: return "0-3 Years"
         if y < 5: return "3-5 Years"
         if y < 7: return "5-7 Years"
@@ -21,27 +24,28 @@ class DomainMapper:
     @staticmethod
     def _format_experience(sector_data):
         """
-        Helper privado: Convierte el dato crudo de la IA (Float) 
-        al formato limpio que quieres en el JSON (String Range).
+        Converts raw AI output (float years) to clean JSON format (string range).
+        Handles both sector-based (companies) and functional (roles) experience types.
         """
         if not sector_data:
             return {
                 "companies": [],
+                "roles": [],
                 "years_range": "No",
                 "has_experience": False
             }
-        
-        # 1. Extraemos los datos crudos de la IA
+
         raw_years = sector_data.get("years", 0)
         companies = sector_data.get("companies", [])
+        roles = sector_data.get("roles", [])
         has_exp = sector_data.get("has_experience", False)
 
-        # 2. Calculamos el Tag (transformación Float -> String)
         range_tag = DomainMapper.get_years_range_tag(raw_years)
+        logger.debug(f"_format_experience → has_experience={has_exp}, years={raw_years}, years_range='{range_tag}', companies={len(companies)}, roles={len(roles)}")
 
-        # 3. Devolvemos el diccionario con la estructura EXACTA que quieres
         return {
             "companies": companies,
+            "roles": roles,
             "years_range": range_tag,
             "has_experience": has_exp
         }
@@ -49,37 +53,36 @@ class DomainMapper:
     @staticmethod
     def map_to_supabase_candidate(ai_data, public_cv_url, source=None):
         """
-        Prepara el diccionario híbrido para Supabase.
-        Combina columnas SQL nuevas y transforma el JSON para que quede limpio.
+        Prepares the hybrid dictionary for Supabase.
+        Combines new SQL columns and transforms the JSON for a clean structure.
         """
-        # 1. Columnas SQL (Campos nuevos fuera del JSON)
+        # 1. SQL Columns (fields outside JSON)
         sql_columns = {
             "name": ai_data.get("name"),
             "email": ai_data.get("email"),
             "phone": ai_data.get("phone"),
-            "linkedin_url": ai_data.get("linkedin_url"), # Ojo: key suele ser linkedin_url en el modelo IA
+            "linkedin_url": ai_data.get("linkedin_url"),
             "cv_url": public_cv_url,
             "assessment": None,
             "source": source
         }
+        logger.debug(f"map_to_supabase_candidate SQL columns: name={'set' if sql_columns['name'] else 'missing'}, email={'set' if sql_columns['email'] else 'missing'}, phone={'set' if sql_columns['phone'] else 'missing'}, linkedin={'set' if sql_columns['linkedin_url'] else 'missing'}, cv_url={'set' if sql_columns['cv_url'] else 'missing'}")
 
-        # Extraemos el bloque de experiencia crudo para procesarlo
         raw_exp = ai_data.get("experience", {})
         raw_edu = ai_data.get("education", {})
         raw_gen = ai_data.get("general", {})
 
-        # 2. JSON Data (Estructura Limpia y Transformada)
+        # 2. JSON Data (Clean and Transformed Structure)
         json_payload = {
             "name": ai_data.get("name"),
             "email": ai_data.get("email"),
             "linkedin_url": ai_data.get("linkedin_url"),
-            
-            # Calculamos el rango total también
+
             "total_years_range": DomainMapper.get_years_range_tag(ai_data.get("total_years", 0)),
-            
+
             "languages": ai_data.get("languages", []),
             "recruiting_processes_history": [],
-            "proposed_team_role": [], # Corregido a singular si así estaba en tu JSON "bueno"
+            "proposed_teams_roles": [],
 
             "general": {
                 "international_locations": raw_gen.get("international_locations", []),
@@ -90,11 +93,10 @@ class DomainMapper:
                 "bachelors": raw_edu.get("bachelors", []),
                 "masters": raw_edu.get("masters", []),
                 "university": raw_edu.get("university", []),
-                "mba": [raw_edu.get("mba")] if raw_edu.get("mba") and raw_edu.get("mba") != "No" else [] 
-                # Nota: La IA a veces devuelve string "No" o el nombre. Lo metemos en lista para consistencia si quieres.
+                "mba": [raw_edu.get("mba")] if raw_edu.get("mba") and raw_edu.get("mba") != "No" else []
             },
 
-            # Aquí aplicamos la limpieza sector por sector
+            # Apply cleanup sector by sector
             "experience": {
                 "consulting": DomainMapper._format_experience(raw_exp.get("consulting")),
                 "audit": DomainMapper._format_experience(raw_exp.get("audit")),
@@ -116,16 +118,18 @@ class DomainMapper:
             }
         }
 
+        logger.debug(f"map_to_supabase_candidate JSON payload keys: {list(json_payload.keys())}")
         return {**sql_columns, "candidate_data": json_payload}
 
     @staticmethod
     def reconstruct_experience_object(tag_list):
         """
-        Reconstruye el objeto de experiencia desde tags planos.
-        (Se mantiene para lectura desde Notion si hiciera falta).
+        Reconstructs experience object from flat Notion multi-select tags.
+        Tags could be company names or role titles (both stored the same way in Notion).
         """
         if not tag_list: return None
-        
+
+        logger.debug(f"reconstruct_experience_object → {len(tag_list)} tag(s) in")
         companies = []
         years_range = None
         for tag in tag_list:
@@ -133,9 +137,11 @@ class DomainMapper:
                 years_range = tag
             elif tag != "No":
                 companies.append(tag)
-        
+
+        logger.debug(f"reconstruct_experience_object → {len(companies)} company/role(s), years_range='{years_range}', has_experience={len(companies) > 0}")
         return {
             "companies": companies,
+            "roles": [],
             "years_range": years_range,
             "has_experience": len(companies) > 0
         }

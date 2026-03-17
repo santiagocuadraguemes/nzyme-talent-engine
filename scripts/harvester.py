@@ -6,18 +6,28 @@ import time
 from dotenv import load_dotenv
 
 
-# Ajuste de path para ejecución local/Lambda
+# Path adjustment for local/Lambda execution
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
 from core.storage_client import StorageClient
-from core.ai_parser import AnalizadorCV
+from core.ai_parser import CVAnalyzer
 from core.notion_builder import NotionBuilder
 from core.domain_mapper import DomainMapper
-from core.utils import descargar_archivo
-from core.constants import PROP_CHECKBOX_PROCESSED, PROP_ID, PROP_NAME, PROP_CV_FILES, PROP_STAGE, PROP_HEADHUNTER
+from core.utils import download_file
+from core.constants import (
+    PROP_CHECKBOX_PROCESSED, PROP_ID, PROP_NAME, PROP_CV_FILES, PROP_STAGE,
+    PROP_HEADHUNTER, PROP_AI_PENDING, PROP_EXP_TOTAL_YEARS,
+    PROP_EXP_CONSULTING, PROP_EXP_AUDIT, PROP_EXP_IB, PROP_EXP_PE,
+    PROP_EXP_VC, PROP_EXP_ENGINEER, PROP_EXP_LAWYER, PROP_EXP_FOUNDER,
+    PROP_EXP_CORP_MA, PROP_EXP_PORTCO, PROP_EXP_MANAGEMENT, PROP_EXP_FINANCE,
+    PROP_EXP_MARKETING, PROP_EXP_OPERATIONS, PROP_EXP_PRODUCT,
+    PROP_EXP_SALES_REVENUE, PROP_EXP_TECHNOLOGY, PROP_EXP_INTERNATIONAL,
+    PROP_EXP_INDUSTRIES, PROP_LANGUAGES, PROP_EDU_BACHELORS, PROP_EDU_MASTERS,
+    PROP_EDU_UNIVERSITIES, PROP_EDU_MBAS,
+)
 from core.logger import get_logger
 
 
@@ -45,68 +55,68 @@ class HarvesterRelational:
         self.main_ds_id = self.notion.get_data_source_id(MAIN_DB_ID) or MAIN_DB_ID
 
 
-    def buscar_candidato_smart(self, email, nombre):
+    def smart_candidate_search(self, email, name):
         """
-        Lógica de coincidencia para Notion.
-        Regla: Email > Nombre.
-        IMPORTANTE: Si coincide el nombre, lo tratamos como el mismo candidato (Merge),
-        aunque el email sea diferente o no exista previamente.
+        Matching logic for Notion.
+        Rule: Email > Name.
+        If the name matches, we treat it as the same candidate (Merge),
+        even if the email is different or doesn't exist yet.
         """
-        # A. Búsqueda por Email
+        # A. Search by Email
         if email:
             res = self.notion.query_data_source(self.main_ds_id, {"property": "Email", "email": {"equals": email}})
             if res: return res[0]
-        
-        # B. Búsqueda por Nombre (Fallback)
-        if nombre:
-            res = self.notion.query_data_source(self.main_ds_id, {"property": "Name", "title": {"equals": nombre}})
+
+        # B. Search by Name (Fallback)
+        if name:
+            res = self.notion.query_data_source(self.main_ds_id, {"property": "Name", "title": {"equals": name}})
             if res:
-                self.logger.info(f"Match por Nombre: '{nombre}'. Asumiendo mismo candidato (Merge).")
+                self.logger.info(f"Match by Name: '{name}'. Assuming same candidate (Merge).")
                 return res[0]
-        
+
         return None
 
 
-    def determinar_stage_inicial(self, ds_id):
+    def determine_initial_stage(self, ds_id):
         schema = self.notion.get_database_schema(ds_id)
-        opciones = schema.get("Stage", {}).get("select", {}).get("options", [])
-        if not opciones: opciones = schema.get("Stage", {}).get("status", {}).get("options", [])
-        if not opciones: return None
-        return opciones[0]["name"] if opciones else None
+        options = schema.get("Stage", {}).get("select", {}).get("options", [])
+        if not options: options = schema.get("Stage", {}).get("status", {}).get("options", [])
+        if not options: return None
+        return options[0]["name"] if options else None
 
 
-    def encontrar_propiedad_relacion(self, ds_id):
+    def find_relation_property(self, ds_id):
         schema = self.notion.get_database_schema(ds_id)
         for name, details in schema.items():
             if details["type"] == "relation": return name
         return "Candidate Relation"
 
 
-    def encontrar_propiedad_unique_id(self, ds_id):
+    def find_unique_id_property(self, ds_id):
         schema = self.notion.get_database_schema(ds_id)
         for name, details in schema.items():
             if details["type"] == "unique_id": return name
         return "ID"
 
 
-    def buscar_cv_en_auxiliar(self, aux_db_id, id_texto):
+    def find_cv_in_auxiliary(self, aux_db_id, id_text):
         """
-        Busca la página del formulario (auxiliar) usando el ID único.
+        Finds the form page (auxiliary) using the unique ID.
         Returns: (url, file_name, is_headhunter, form_data)
 
         form_data contains basic info from the form (name, email, linkedin) for cases without CV.
         """
-        numeros = re.findall(r'\d+', str(id_texto))
-        if not numeros: return None, None, False, None
-        id_numerico = int(numeros[-1])
+        numbers = re.findall(r'\d+', str(id_text))
+        if not numbers: return None, None, False, None
+        numeric_id = int(numbers[-1])
 
         ds_aux = self.notion.get_data_source_id(aux_db_id)
         if not ds_aux: return None, None, False, None
 
-        col_id_name = self.encontrar_propiedad_unique_id(ds_aux)
-        filtro = {"property": col_id_name, "unique_id": {"equals": id_numerico}}
+        col_id_name = self.find_unique_id_property(ds_aux)
+        filter_params = {"property": col_id_name, "unique_id": {"equals": numeric_id}}
 
-        res = self.notion.query_data_source(ds_aux, filtro)
+        res = self.notion.query_data_source(ds_aux, filter_params)
         if not res: return None, None, False, None
 
         props = res[0]["properties"]
@@ -126,13 +136,13 @@ class HarvesterRelational:
             # No CV attached - return form_data for minimal processing
             return None, None, is_headhunter, form_data
 
-        archivo = files[0]
-        url = archivo.get("file", {}).get("url") or archivo.get("external", {}).get("url")
+        file_obj = files[0]
+        url = file_obj.get("file", {}).get("url") or file_obj.get("external", {}).get("url")
 
         if not url:
             return None, None, is_headhunter, form_data
 
-        return url, archivo["name"], is_headhunter, form_data
+        return url, file_obj["name"], is_headhunter, form_data
 
     def _extract_title(self, title_prop):
         """Helper to extract plain text from Notion title property."""
@@ -150,6 +160,11 @@ class HarvesterRelational:
             "has_experience": False,
             "years": 0,
             "companies": []
+        }
+        empty_functional = {
+            "has_experience": False,
+            "years": 0,
+            "roles": []
         }
 
         return {
@@ -173,15 +188,15 @@ class HarvesterRelational:
                 "engineer_role": empty_sector,
                 "lawyer": empty_sector,
                 "founder": empty_sector,
-                "management": empty_sector,
+                "management": empty_functional,
                 "corp_ma": empty_sector,
                 "portco_roles": empty_sector,
-                "finance": empty_sector,
-                "marketing": empty_sector,
-                "operations": empty_sector,
-                "product": empty_sector,
-                "sales_revenue": empty_sector,
-                "technology": empty_sector,
+                "finance": empty_functional,
+                "marketing": empty_functional,
+                "operations": empty_functional,
+                "product": empty_functional,
+                "sales_revenue": empty_functional,
+                "technology": empty_functional,
             },
             "general": {
                 "international_locations": [],
@@ -194,34 +209,37 @@ class HarvesterRelational:
     def _process_with_cv(self, notion_url, file_name, process_entry):
         """
         Downloads CV, uploads to storage, and runs AI parsing.
-        Returns: (datos_ia, public_url) or (None, None) on failure.
+        Returns: (ai_data, public_url, ai_failed)
+          - Download/upload failure -> (None, None, False)
+          - AI failure only -> (None, public_url, True) — CV stored, just couldn't parse
+          - Success -> (ai_data, public_url, False)
         """
-        local_path = descargar_archivo(notion_url, file_name, TEMP_FOLDER)
+        local_path = download_file(notion_url, file_name, TEMP_FOLDER)
         if not local_path:
-            return None, None
+            return None, None, False
 
-        public_url = self.storage.subir_cv_desde_url(notion_url, file_name)
+        public_url = self.storage.upload_cv_from_url(notion_url, file_name)
         if not public_url:
             try: os.remove(local_path)
-            except: pass
-            return None, None
+            except OSError: pass
+            return None, None, False
 
         matrix_chars = process_entry.get("matrix_characteristics")
-        self.logger.info(f"Analizando CV: {file_name}")
-        datos_ia = self.ai.procesar_cv(local_path, matrix_characteristics=matrix_chars)
+        self.logger.info(f"Analyzing CV: {file_name}")
+        ai_data = self.ai.process_cv(local_path, matrix_characteristics=matrix_chars)
 
         try: os.remove(local_path)
-        except: pass
+        except OSError: pass
 
-        if not datos_ia:
-            return None, None
+        if not ai_data:
+            return None, public_url, True
 
-        return datos_ia, public_url
+        return ai_data, public_url, False
 
     def _process_with_linkedin(self, linkedin_url, process_entry):
         """
         Fetches LinkedIn profile via Exa and parses with AI.
-        Returns: datos_ia dict or None on failure.
+        Returns: ai_data dict or None on failure.
         """
         if not self.exa:
             return None
@@ -233,24 +251,24 @@ class HarvesterRelational:
 
         matrix_chars = process_entry.get("matrix_characteristics")
         self.logger.info("Parsing LinkedIn profile with AI")
-        datos_ia = self.ai.procesar_linkedin(text, matrix_characteristics=matrix_chars)
+        ai_data = self.ai.process_linkedin(text, matrix_characteristics=matrix_chars)
 
-        if not datos_ia:
+        if not ai_data:
             self.logger.warning("AI failed to parse LinkedIn profile")
             return None
 
-        return datos_ia
+        return ai_data
 
-    # --- LÓGICA: BATCH SPLITTER ---
-    def procesar_bulk_imports(self, procesos):
+    # --- BATCH SPLITTER ---
+    def process_bulk_imports(self, processes):
         """
-        Revisa las colas de 'Bulk Queue'.
-        Desglosa archivos múltiples en entradas individuales para el Candidate Form.
+        Checks the 'Bulk Queue' queues.
+        Splits multi-file entries into individual Candidate Form entries.
         """
-        for proc in procesos:
+        for proc in processes:
             bulk_db_id = proc.get("notion_bulk_id")
             form_db_id = proc.get("notion_form_id")
-            
+
             if not bulk_db_id or not form_db_id: continue
 
 
@@ -258,24 +276,27 @@ class HarvesterRelational:
             if not ds_bulk: continue
 
 
-            filtro = {"property": PROP_CHECKBOX_PROCESSED, "checkbox": {"equals": False}}
-            lotes = self.notion.query_data_source(ds_bulk, filtro)
-            
-            if lotes:
-                self.logger.info(f"Desglosando {len(lotes)} lotes en '{proc['process_name']}'")
+            filter_params = {"property": PROP_CHECKBOX_PROCESSED, "checkbox": {"equals": False}}
+            batches = self.notion.query_data_source(ds_bulk, filter_params)
 
+            if batches:
+                self.logger.info(f"Splitting {len(batches)} batches in '{proc['process_name']}'")
+                self.logger.debug(f"Bulk: {len(batches)} batches found for process '{proc['process_name']}'")
 
-            for lote in lotes:
-                lote_id = lote["id"]
-                props = lote["properties"]
-                
-                files = props.get("CVs", {}).get("files", []) 
-                if not files: 
-                    self.notion.update_page(lote_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
+            for batch in batches:
+                batch_id = batch["id"]
+                props = batch["properties"]
+
+                files = props.get("CVs", {}).get("files", [])
+                self.logger.debug(f"Bulk batch {batch_id[:8]}...: {len(files)} file(s)")
+                if not files:
+                    res_empty = self.notion.update_page(batch_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
+                    if res_empty.status_code != 200:
+                        self.logger.error(f"Bulk mark-processed FAILED — batch={batch_id[:8]}..., status={res_empty.status_code}")
                     continue
 
 
-                errores_en_lote = False
+                errors_in_batch = False
 
 
                 for file_obj in files:
@@ -286,15 +307,15 @@ class HarvesterRelational:
 
 
                     try:
-                        public_url = self.storage.subir_cv_desde_url(notion_url, file_name)
+                        public_url = self.storage.upload_cv_from_url(notion_url, file_name)
 
                         if not public_url:
-                            self.logger.error(f"Error subiendo {file_name} a storage")
-                            errores_en_lote = True
+                            self.logger.error(f"Error uploading {file_name} to storage")
+                            errors_in_batch = True
                             continue
                     except Exception as e:
-                        self.logger.error(f"Excepción subiendo {file_name}: {e}")
-                        errores_en_lote = True
+                        self.logger.error(f"Exception uploading {file_name}: {e}")
+                        errors_in_batch = True
                         continue
 
 
@@ -309,196 +330,253 @@ class HarvesterRelational:
                                 }
                             ]
                         },
-                        PROP_HEADHUNTER: {"checkbox": True}  # Mark as coming from bulk/headhunter
+                        PROP_HEADHUNTER: {"checkbox": True}
                     }
 
                     res = self.notion.create_page(form_db_id, payload)
 
                     if res.status_code != 200:
-                        errores_en_lote = True
-                        self.logger.error(f"Error creando '{file_name}'. Status: {res.status_code}")
+                        errors_in_batch = True
+                        self.logger.error(f"Error creating '{file_name}'. Status: {res.status_code} | Body: {res.text[:500]}")
+                    else:
+                        self.logger.debug(f"Bulk: split file '{file_name}' -> new Form entry created")
+                        # Delay so Notion automation fires separately for each entry
+                        time.sleep(10)
 
 
-                self.notion.update_page(lote_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
+                res_done = self.notion.update_page(batch_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
+                if res_done.status_code != 200:
+                    self.logger.error(f"Bulk mark-processed FAILED — batch={batch_id[:8]}..., status={res_done.status_code}")
 
 
-    # --- PROCESAMIENTO ESTÁNDAR ---
-    def procesar_candidato(self, cand, process_entry, relation_col_name, stage_inicial):
+    # --- STANDARD PROCESSING ---
+    def process_candidate(self, cand, process_entry, relation_col_name, initial_stage):
         page_id = cand["id"]
         props = cand["properties"]
 
-        process_name_actual = process_entry["process_name"]
-        process_type_actual = process_entry.get("process_type")
+        current_process_name = process_entry["process_name"]
+        current_process_type = process_entry.get("process_type")
 
-        # 1. Obtener CV y datos del formulario
+        # 1. Get CV and form data (retry to handle Notion async indexing delay)
         id_text = props.get(PROP_ID, {}).get("rich_text", [])[0]["plain_text"] if props.get(PROP_ID, {}).get("rich_text", []) else ""
-        notion_url, file_name, is_headhunter, form_data = self.buscar_cv_en_auxiliar(process_entry["notion_form_id"], id_text)
+        notion_url, file_name, is_headhunter, form_data = self.find_cv_in_auxiliary(process_entry["notion_form_id"], id_text)
+
+        if form_data is None and id_text:
+            for attempt in range(3):
+                self.logger.info(f"Form entry not found yet, retrying in 5s (attempt {attempt + 1}/3)")
+                time.sleep(5)
+                notion_url, file_name, is_headhunter, form_data = self.find_cv_in_auxiliary(process_entry["notion_form_id"], id_text)
+                if form_data is not None:
+                    break
 
         # Two-path processing: CV vs No-CV
+        ai_failed = False
+        needs_ai_pending = False
         if notion_url:
             # PATH A: Full CV processing
-            datos_ia, public_url = self._process_with_cv(notion_url, file_name, process_entry)
-            if not datos_ia:
-                return
+            self.logger.debug(f"Path A: processing with CV ({file_name})")
+            ai_data, public_url, ai_failed = self._process_with_cv(notion_url, file_name, process_entry)
+            if not ai_data and not ai_failed:
+                return  # download/upload truly failed
+            if ai_failed:
+                self.logger.warning(f"AI unavailable for {file_name}. Creating skeleton record.")
+                if not form_data:
+                    form_data = {"name": file_name, "email": None, "linkedin_url": None}
+                ai_data = self._create_minimal_candidate_data(form_data)
         else:
             # PATH B: No CV
+            _fd_name = form_data.get('name') if form_data else None
+            self.logger.debug(f"Path B: no CV, form_data name_prefix={(_fd_name[:2]+'***') if _fd_name else None}")
             if not form_data or not form_data.get("name"):
                 self.logger.warning("No CV and no form data - skipping")
                 return
 
             linkedin_url = form_data.get("linkedin_url")
-            datos_ia = None
+            ai_data = None
 
             # Try LinkedIn enrichment if URL exists
             if linkedin_url:
                 self.logger.info(f"Trying LinkedIn enrichment for: {form_data.get('name')}")
-                datos_ia = self._process_with_linkedin(linkedin_url, process_entry)
+                ai_data = self._process_with_linkedin(linkedin_url, process_entry)
 
-                if datos_ia:
+                if ai_data:
                     # Preserve form_data values the AI won't have
-                    datos_ia["linkedin_url"] = linkedin_url
-                    if form_data.get("email") and not datos_ia.get("email"):
-                        datos_ia["email"] = form_data["email"]
-                    if not datos_ia.get("phone"):
-                        datos_ia["phone"] = None
+                    ai_data["linkedin_url"] = linkedin_url
+                    if form_data.get("email") and not ai_data.get("email"):
+                        ai_data["email"] = form_data["email"]
+                    if not ai_data.get("phone"):
+                        ai_data["phone"] = None
 
             # Fallback to minimal record if no LinkedIn or enrichment failed
-            if not datos_ia:
-                self.logger.info(f"Processing candidate without CV: {form_data.get('name')}")
-                datos_ia = self._create_minimal_candidate_data(form_data)
+            if not ai_data:
+                self.logger.info(f"Processing candidate without CV/LinkedIn: {form_data.get('name')}. Marking AI Pending.")
+                ai_data = self._create_minimal_candidate_data(form_data)
+                needs_ai_pending = True
 
             public_url = None
 
-        # --- 2. GESTIÓN DE IDENTIDAD Y FUSIÓN ---
+        # --- 2. IDENTITY MANAGEMENT AND MERGE ---
 
-        cand_db, id_madre_notion = self.supa_manager.resolver_identidad_candidato(datos_ia.get("email"), datos_ia["name"])
+        self.logger.debug(f"Resolving identity for: {ai_data['name']}")
+        cand_db, main_notion_id = self.supa_manager.resolve_candidate_identity(ai_data.get("email"), ai_data["name"])
 
-        historial_previo = []
-        team_role_previo = []
+        previous_history = []
+        previous_team_role = []
 
         # Determine if we should set source
-        # Set source for: new candidates OR existing candidates with empty source
         is_new_candidate = (cand_db is None)
         existing_source = cand_db.get("source") if cand_db else None
         should_set_source = is_new_candidate or (not existing_source)
         source_value = "Headhunter" if is_headhunter else "LinkedIn"
 
         if cand_db:
-            self.logger.info(f"Candidato existente (ID: {id_madre_notion}). Fusionando datos")
+            self.logger.debug(f"Identity resolved: merge (existing notion_id={main_notion_id[:8] if main_notion_id else None}...)")
+            self.logger.info(f"Existing candidate (ID: {main_notion_id}). Merging data")
 
             cand_json = cand_db.get("candidate_data") or {}
 
-            historial_previo = cand_json.get("recruiting_processes_history", [])
-            team_role_previo = cand_json.get("proposed_teams_roles", [])
+            previous_history = cand_json.get("recruiting_processes_history", [])
+            previous_team_role = cand_json.get("proposed_teams_roles", [])
 
         else:
-            self.logger.info(f"Candidato nuevo (Source: {source_value})")
+            self.logger.debug("Identity resolved: new candidate")
+            self.logger.info(f"New candidate (Source: {source_value})")
 
 
         # Determine source to pass (new candidates OR existing with empty source)
         source_to_pass = source_value if should_set_source else None
         self.logger.info(f"Source tracking: is_new={is_new_candidate}, existing_source={existing_source}, should_set={should_set_source}, passing={source_to_pass}")
 
-        props_madre = NotionBuilder.build_candidate_payload(
-            datos_ia,
+        main_props = NotionBuilder.build_candidate_payload(
+            ai_data,
             public_url,
-            process_name_actual,
-            existing_history=historial_previo,
-            process_type=process_type_actual,
-            existing_team_role=team_role_previo,
+            current_process_name,
+            existing_history=previous_history,
+            process_type=current_process_type,
+            existing_team_role=previous_team_role,
             source=source_to_pass
         )
-        
-        # --- 4. ESCRITURA ---
-        error_madre = False
-        props_madre[PROP_CHECKBOX_PROCESSED] = {"checkbox": True}
 
-        if id_madre_notion:
-            res_op = self.notion.update_page(id_madre_notion, props_madre)
+        # --- 4. WRITE ---
+        main_error = False
+        main_props[PROP_CHECKBOX_PROCESSED] = {"checkbox": True}
+        if ai_failed or needs_ai_pending:
+            main_props[PROP_AI_PENDING] = {"checkbox": True}
+
+        if main_notion_id:
+            self.logger.debug(f"Notion write: update existing page {main_notion_id[:8]}...")
+            res_op = self.notion.update_page(main_notion_id, main_props)
         else:
-            res_op = self.notion.create_page(MAIN_DB_ID, props_madre)
+            self.logger.debug("Notion write: create new Main DB page")
+            res_op = self.notion.create_page(MAIN_DB_ID, main_props)
             if res_op.status_code == 200:
-                id_madre_notion = res_op.json()["id"]
+                main_notion_id = res_op.json()["id"]
 
 
         if res_op.status_code != 200:
-            self.logger.error(f"Error Notion API: {res_op.status_code}")
-            error_madre = True
+            op_type = "update" if main_notion_id else "create"
+            self.logger.error(
+                f"Notion {op_type} FAILED — candidate='{ai_data.get('name', '?')}', "
+                f"process='{current_process_name}', page={main_notion_id or 'new'}, "
+                f"status={res_op.status_code}, body={res_op.text[:300]}"
+            )
+            main_error = True
             return
 
 
         # 5. SUPABASE SYNC
-        if not error_madre:
-            datos_candidato_sql = DomainMapper.map_to_supabase_candidate(
-                datos_ia,
+        if not main_error:
+            candidate_sql_data = DomainMapper.map_to_supabase_candidate(
+                ai_data,
                 public_url,
                 source=source_to_pass
             )
-            
-            json_payload = datos_candidato_sql["candidate_data"]
-            
-            full_history = list(historial_previo)
-            if process_name_actual not in full_history: full_history.append(process_name_actual)
+
+            json_payload = candidate_sql_data["candidate_data"]
+
+            if ai_failed or needs_ai_pending:
+                json_payload["ai_pending"] = True
+                json_payload["ai_pending_cv_url"] = public_url
+                json_payload["ai_pending_process_name"] = current_process_name
+
+            full_history = list(previous_history)
+            if current_process_name not in full_history: full_history.append(current_process_name)
             json_payload["recruiting_processes_history"] = full_history
 
 
-            full_roles = list(team_role_previo)
-            if process_type_actual and process_type_actual not in full_roles: full_roles.append(process_type_actual)
+            full_roles = list(previous_team_role)
+            if current_process_type and current_process_type not in full_roles: full_roles.append(current_process_type)
             json_payload["proposed_teams_roles"] = full_roles
 
 
-            uuid_candidato = self.supa_manager.gestion_candidato(datos_candidato_sql, id_madre_notion)
+            candidate_uuid = self.supa_manager.manage_candidate(candidate_sql_data, main_notion_id)
+            self.logger.debug(f"Supabase sync result: candidate_uuid={candidate_uuid[:8] if candidate_uuid else None}...")
 
-
-            if uuid_candidato:
-                self.supa_manager.crear_aplicacion(
-                    uuid_candidato, 
-                    process_entry["notion_workflow_id"], 
-                    page_id, 
-                    stage_inicial
+            if candidate_uuid:
+                app_id = self.supa_manager.create_application(
+                    candidate_uuid,
+                    process_entry["notion_workflow_id"],
+                    page_id,
+                    initial_stage
                 )
+
+                # 5b. Discover and store Outcome Form DB ID
+                if app_id:
+                    outcome_db_id = self.notion.find_child_database(page_id, "Process Outcome Form")
+                    if outcome_db_id:
+                        self.supa_manager.update_application_outcome_id(app_id, outcome_db_id)
+                        self.logger.debug(f"Outcome Form DB stored: {outcome_db_id[:8]}... for app {app_id[:8]}...")
+                    else:
+                        self.logger.debug(f"No Outcome Form DB found on workflow page {page_id[:8]}...")
 
 
         # 6. Strategic Assessment
-        if datos_ia.get("strategic_assessment"):
-            self._rellenar_strategic_assessment(page_id, datos_ia["strategic_assessment"])
+        if not ai_failed and not needs_ai_pending and ai_data.get("strategic_assessment"):
+            self._fill_strategic_assessment(page_id, ai_data["strategic_assessment"])
 
 
-        # 7. CIERRE
+        # 7. CLOSE
         update_props = {
             PROP_CHECKBOX_PROCESSED: {"checkbox": True},
-            PROP_NAME: {"title": [{"text": {"content": datos_ia["name"]}}]},
+            PROP_NAME: {"title": [{"text": {"content": ai_data["name"]}}]},
         }
         # Only set CV file if we have one
         if public_url:
-            update_props[PROP_CV_FILES] = {"files": [{"name": "CV.pdf", "external": {"url": public_url}}]}
-        if id_madre_notion:
-            update_props[relation_col_name] = {"relation": [{"id": id_madre_notion}]}
-        if stage_inicial:
-            update_props[PROP_STAGE] = {"select": {"name": stage_inicial}}
+            candidate_name = ai_data.get("name", "Unknown")
+            cv_display_name = f"CV - {candidate_name}"
+            update_props[PROP_CV_FILES] = {"files": [{"name": cv_display_name, "external": {"url": public_url}}]}
+        if main_notion_id:
+            update_props[relation_col_name] = {"relation": [{"id": main_notion_id}]}
+        if initial_stage:
+            update_props[PROP_STAGE] = {"select": {"name": initial_stage}}
 
 
-        self.notion.update_page(page_id, update_props)
-        self.logger.info("Candidato procesado correctamente")
+        res_close = self.notion.update_page(page_id, update_props)
+        if res_close.status_code != 200:
+            self.logger.error(
+                f"Workflow close FAILED — candidate='{ai_data.get('name', '?')}', "
+                f"page={page_id[:8]}..., status={res_close.status_code}"
+            )
+        self.logger.info("Candidate processed successfully")
 
 
-    def _rellenar_strategic_assessment(self, candidate_page_id, assessment_list):
+    def _fill_strategic_assessment(self, candidate_page_id, assessment_list):
         """
-        Busca la tabla 'Past Experience [AI-generated]', mapea las filas existentes
-        y las rellena con los datos de la IA.
+        Finds the 'Past Experience [AI-generated]' table, maps existing rows
+        and fills them with AI data.
         """
         if not assessment_list:
             self.logger.info("No strategic assessment data to fill (skipping)")
             return
 
-        time.sleep(4) 
+        time.sleep(4)
 
 
         db_title = "Past Experience [AI-generated]"
         child_db_id = self.notion.find_child_database(candidate_page_id, db_title)
-        
+
         if not child_db_id:
-            self.logger.warning(f"DB '{db_title}' no encontrada")
+            self.logger.warning(f"DB '{db_title}' not found")
             return
 
 
@@ -506,7 +584,7 @@ class HarvesterRelational:
 
 
         rows = self.notion.query_data_source(ds_child, filter_params=None)
-        
+
         row_map = {}
         for r in rows:
             props = r["properties"]
@@ -523,46 +601,296 @@ class HarvesterRelational:
             char_name = item.get("characteristic", "").strip()
             score_val = item.get("score")
             comment_val = item.get("comment", "")
-            
+
             target_id = row_map.get(char_name)
-            
+
             if target_id:
                 payload = {
                     "AI Score": {"select": {"name": score_val}},
                     "AI Comments": {"rich_text": [{"text": {"content": comment_val}}]}
                 }
-                
+
                 res = self.notion.update_page(target_id, payload)
-                
+
                 if res.status_code == 200:
                     updates_count += 1
                 else:
-                    self.logger.error(f"Error escribiendo '{char_name}': {res.status_code}")
+                    self.logger.error(f"Error writing '{char_name}': {res.status_code} | Body: {res.text[:500]}")
 
 
-        self.logger.info(f"Assessment completado: {updates_count}/{len(assessment_list)} filas")
+        self.logger.info(f"Assessment completed: {updates_count}/{len(assessment_list)} rows")
 
 
-    def run_once(self):
-        """Ejecuta una pasada completa por todos los procesos activos."""
-        self.logger.info("Harvester iniciando")
-        
-        procesos = self.supa_manager.obtener_procesos_activos()
-        if not procesos:
-            self.logger.info("Sin procesos activos")
+    def _reprocess_ai_pending(self):
+        """
+        Second pass: finds candidates with AI Pending checkbox=true in Notion Main DB,
+        re-runs AI parsing, and backfills experience/education data.
+
+        Uses Notion as source of truth (not Supabase JSONB) to avoid race condition
+        where Observer overwrites ai_pending keys before reprocessor runs.
+        """
+        # 1. Query Notion Main DB for AI Pending = true
+        try:
+            filter_params = {"property": PROP_AI_PENDING, "checkbox": {"equals": True}}
+            pending_pages = self.notion.query_data_source(self.main_ds_id, filter_params)
+        except Exception as e:
+            self.logger.error(f"Error querying AI-pending candidates from Notion: {e}")
             return
 
+        if not pending_pages:
+            return
 
-        # --- PASO 1: BATCH SPLITTER ---
-        self.procesar_bulk_imports(procesos)
+        # Batch limit
+        pending_pages = pending_pages[:5]
+        self.logger.info(f"Reprocessing {len(pending_pages)} AI-pending candidates")
+
+        for page in pending_pages:
+            notion_page_id = page["id"]
+            props = page.get("properties", {})
+
+            # 2. Extract CV URL from Notion page's CV file property
+            cv_files = props.get(PROP_CV_FILES, {}).get("files", [])
+            cv_url = None
+            if cv_files:
+                first_file = cv_files[0]
+                cv_url = first_file.get("external", {}).get("url") or first_file.get("file", {}).get("url")
+
+            candidate_name = self._extract_title(props.get(PROP_NAME, {})) or "Unknown"
+
+            if not cv_url:
+                self.logger.warning(f"Skipping AI-pending candidate {candidate_name}: no CV URL in Notion")
+                continue
+            self.logger.debug(f"AI-pending {candidate_name}: CV URL found ({cv_url[:40]}...)")
+
+            # 3. Look up candidate in Supabase to get UUID and existing JSONB
+            candidate = self.supa_manager.get_candidate_by_notion_page_id(notion_page_id)
+            if not candidate:
+                self.logger.warning(f"Skipping AI-pending candidate {candidate_name}: not found in Supabase")
+                continue
+
+            cand_json = candidate.get("candidate_data") or {}
+
+            # 4. Get matrix_characteristics and workflow page ID from applications
+            matrix_chars = None
+            workflow_page_id = None
+            applications = self.supa_manager.get_applications_by_candidate_id(candidate["id"])
+            if applications:
+                latest_app = applications[0]  # Already ordered by created_at desc
+                matrix_chars = latest_app.get("matrix_characteristics")
+                workflow_page_id = latest_app.get("notion_page_id")
+
+            # 5. Download CV from permanent storage URL
+            safe_name = cv_url.split("/")[-1] if "/" in cv_url else "temp_cv"
+            local_path = download_file(cv_url, safe_name, TEMP_FOLDER)
+            if not local_path:
+                self.logger.warning(f"Could not download CV for reprocessing: {candidate_name}")
+                continue
+
+            # 6. Run AI parsing
+            ai_data = self.ai.process_cv(local_path, matrix_characteristics=matrix_chars)
+            try: os.remove(local_path)
+            except OSError: pass
+
+            if not ai_data:
+                self.logger.warning(f"AI still unavailable for {candidate_name}. Will retry next run.")
+                continue
+            self.logger.debug(f"AI-pending {candidate_name}: parse succeeded")
+
+            # 7. Update Notion — ONLY experience/education/languages fields
+            exp = ai_data.get("experience", {})
+            edu = ai_data.get("education", {})
+            gen = ai_data.get("general", {})
+
+            notion_props = {}
+
+            # Total years
+            total_range = DomainMapper.get_years_range_tag(ai_data.get("total_years", 0))
+            if total_range:
+                notion_props[PROP_EXP_TOTAL_YEARS] = {"select": {"name": total_range, "color": "default"}}
+
+            sector_mapping = {
+                PROP_EXP_CONSULTING: exp.get("consulting"),
+                PROP_EXP_AUDIT: exp.get("audit"),
+                PROP_EXP_IB: exp.get("ib"),
+                PROP_EXP_PE: exp.get("pe"),
+                PROP_EXP_VC: exp.get("vc"),
+                PROP_EXP_ENGINEER: exp.get("engineer_role"),
+                PROP_EXP_LAWYER: exp.get("lawyer"),
+                PROP_EXP_FOUNDER: exp.get("founder"),
+                PROP_EXP_CORP_MA: exp.get("corp_ma"),
+                PROP_EXP_PORTCO: exp.get("portco_roles"),
+            }
+            for prop_name, data in sector_mapping.items():
+                notion_props[prop_name] = {"multi_select": NotionBuilder._create_experience_tags(data)}
+
+            functional_mapping = {
+                PROP_EXP_MANAGEMENT: exp.get("management"),
+                PROP_EXP_FINANCE: exp.get("finance"),
+                PROP_EXP_MARKETING: exp.get("marketing"),
+                PROP_EXP_OPERATIONS: exp.get("operations"),
+                PROP_EXP_PRODUCT: exp.get("product"),
+                PROP_EXP_SALES_REVENUE: exp.get("sales_revenue"),
+                PROP_EXP_TECHNOLOGY: exp.get("technology"),
+            }
+            for prop_name, data in functional_mapping.items():
+                notion_props[prop_name] = {"multi_select": NotionBuilder._create_functional_tags(data)}
+
+            # General lists
+            if gen.get("international_locations"):
+                notion_props[PROP_EXP_INTERNATIONAL] = {"multi_select": NotionBuilder._format_multi_select(gen["international_locations"])}
+            if gen.get("industries_specialized"):
+                notion_props[PROP_EXP_INDUSTRIES] = {"multi_select": NotionBuilder._format_multi_select(gen["industries_specialized"])}
+
+            # Languages
+            if ai_data.get("languages"):
+                notion_props[PROP_LANGUAGES] = {"multi_select": NotionBuilder._format_multi_select(ai_data["languages"])}
+
+            # Education
+            if edu.get("bachelors"):
+                notion_props[PROP_EDU_BACHELORS] = {"multi_select": NotionBuilder._format_multi_select(edu["bachelors"])}
+            if edu.get("masters"):
+                notion_props[PROP_EDU_MASTERS] = {"multi_select": NotionBuilder._format_multi_select(edu["masters"])}
+            if edu.get("university"):
+                notion_props[PROP_EDU_UNIVERSITIES] = {"multi_select": NotionBuilder._format_multi_select(edu["university"])}
+            mba_val = edu.get("mba")
+            if isinstance(mba_val, str) and mba_val != "No":
+                notion_props[PROP_EDU_MBAS] = {"multi_select": NotionBuilder._format_multi_select([mba_val])}
+
+            # Uncheck AI Pending
+            notion_props[PROP_AI_PENDING] = {"checkbox": False}
+
+            res_notion = self.notion.update_page(notion_page_id, notion_props)
+            if res_notion.status_code != 200:
+                self.logger.error(f"Error updating Notion for reprocessed candidate: {res_notion.status_code}")
+                continue
+            self.logger.debug(f"AI-pending {candidate_name}: Notion updated (page {notion_page_id[:8]}...)")
+
+            # 8. Update Supabase — merge AI data into existing candidate_data JSONB
+            raw_exp = ai_data.get("experience", {})
+            updated_json = dict(cand_json)
+
+            updated_json["total_years_range"] = DomainMapper.get_years_range_tag(ai_data.get("total_years", 0))
+            updated_json["languages"] = ai_data.get("languages", [])
+            updated_json["general"] = {
+                "international_locations": gen.get("international_locations", []),
+                "industries_specialized": gen.get("industries_specialized", []),
+            }
+            updated_json["education"] = {
+                "bachelors": edu.get("bachelors", []),
+                "masters": edu.get("masters", []),
+                "university": edu.get("university", []),
+                "mba": [edu.get("mba")] if edu.get("mba") and edu.get("mba") != "No" else [],
+            }
+            updated_json["experience"] = {
+                "consulting": DomainMapper._format_experience(raw_exp.get("consulting")),
+                "audit": DomainMapper._format_experience(raw_exp.get("audit")),
+                "ib": DomainMapper._format_experience(raw_exp.get("ib")),
+                "pe": DomainMapper._format_experience(raw_exp.get("pe")),
+                "vc": DomainMapper._format_experience(raw_exp.get("vc")),
+                "engineer_role": DomainMapper._format_experience(raw_exp.get("engineer_role")),
+                "lawyer": DomainMapper._format_experience(raw_exp.get("lawyer")),
+                "founder": DomainMapper._format_experience(raw_exp.get("founder")),
+                "management": DomainMapper._format_experience(raw_exp.get("management")),
+                "corp_ma": DomainMapper._format_experience(raw_exp.get("corp_ma")),
+                "portco_roles": DomainMapper._format_experience(raw_exp.get("portco_roles")),
+                "finance": DomainMapper._format_experience(raw_exp.get("finance")),
+                "marketing": DomainMapper._format_experience(raw_exp.get("marketing")),
+                "operations": DomainMapper._format_experience(raw_exp.get("operations")),
+                "product": DomainMapper._format_experience(raw_exp.get("product")),
+                "sales_revenue": DomainMapper._format_experience(raw_exp.get("sales_revenue")),
+                "technology": DomainMapper._format_experience(raw_exp.get("technology")),
+            }
+
+            # Remove ai_pending keys
+            updated_json.pop("ai_pending", None)
+            updated_json.pop("ai_pending_cv_url", None)
+            updated_json.pop("ai_pending_process_name", None)
+
+            try:
+                self.supa_manager.client.table("NzymeTalentNetwork").update({
+                    "candidate_data": updated_json,
+                    "updated_at": "now()"
+                }).eq("id", candidate["id"]).execute()
+                self.logger.debug(f"AI-pending {candidate_name}: Supabase merged (id={candidate['id'][:8]}...)")
+            except Exception as e:
+                self.logger.error(f"Error updating Supabase for reprocessed candidate: {e}")
+                continue
+
+            # 9. Fill strategic assessment using WORKFLOW page ID (not Main DB page ID)
+            if ai_data.get("strategic_assessment") and workflow_page_id:
+                self._fill_strategic_assessment(workflow_page_id, ai_data["strategic_assessment"])
+            elif ai_data.get("strategic_assessment"):
+                self.logger.warning(f"No workflow page found for {candidate_name}, skipping strategic assessment")
+
+            self.logger.info(f"Successfully reprocessed: {candidate_name}")
+
+    def process_single_from_webhook(self, page_id, process_context):
+        """
+        Processes unprocessed candidates for a specific process, triggered by webhook.
+        Queries the Workflow DB for candidates with Processed=false and ID populated.
+
+        Note: page_id is the Form DB page that triggered the webhook, but processing
+        uses Workflow DB pages (created by Notion automation). Retries up to 3 times
+        (5s apart) to wait for the automation. EventBridge is the final fallback.
+        """
+        wf_db_id = process_context["notion_workflow_id"]
+        self.logger.debug(f"[WEBHOOK] Resolving data source for workflow {wf_db_id[:8]}...")
+        ds_wf = self.notion.get_data_source_id(wf_db_id)
+        if not ds_wf:
+            self.logger.error(f"Could not resolve data source for workflow {wf_db_id}")
+            return
+        self.logger.debug(f"[WEBHOOK] Data source resolved: {ds_wf[:8]}...")
+
+        filter_params = {
+            "and": [
+                {"property": PROP_CHECKBOX_PROCESSED, "checkbox": {"equals": False}},
+                {"property": PROP_ID, "rich_text": {"is_not_empty": True}}
+            ]
+        }
+        candidates = self.notion.query_data_source(ds_wf, filter_params)
+
+        # Retry: Notion automation may not have created the Workflow entry yet
+        if not candidates:
+            for attempt in range(3):
+                self.logger.info(f"[WEBHOOK] No unprocessed candidates yet, waiting for Notion automation (attempt {attempt + 1}/3)")
+                time.sleep(5)
+                candidates = self.notion.query_data_source(ds_wf, filter_params)
+                if candidates:
+                    break
+
+        if not candidates:
+            self.logger.info("[WEBHOOK] No unprocessed candidates after retries. EventBridge will catch them.")
+            return
+
+        self.logger.debug(f"[WEBHOOK] {len(candidates)} unprocessed candidate(s) found in Workflow DB")
+        rel_col = self.find_relation_property(ds_wf)
+        stage_init = self.determine_initial_stage(ds_wf)
+
+        self.logger.info(f"[WEBHOOK] Processing {len(candidates)} candidates")
+        for cand in candidates[:MAX_CVS_PER_RUN]:
+            self.process_candidate(cand, process_context, rel_col, stage_init)
+
+    def run_once(self):
+        """Executes a full pass through all active processes."""
+        self.logger.info("Harvester starting")
+
+        processes = self.supa_manager.get_active_processes()
+        if not processes:
+            self.logger.info("No active processes")
+            return
+        self.logger.debug(f"run_once: {len(processes)} active process(es)")
 
 
-        # --- PASO 2: PROCESAMIENTO ESTÁNDAR ---
-        cvs_procesados_hoy = 0
-        for proc in procesos:
-            
-            if cvs_procesados_hoy >= MAX_CVS_PER_RUN:
-                self.logger.warning(f"Límite de seguridad alcanzado ({MAX_CVS_PER_RUN} CVs)")
+        # --- STEP 1: BATCH SPLITTER ---
+        self.process_bulk_imports(processes)
+
+
+        # --- STEP 2: STANDARD PROCESSING ---
+        cvs_processed_today = 0
+        for proc in processes:
+
+            if cvs_processed_today >= MAX_CVS_PER_RUN:
+                self.logger.warning(f"Safety limit reached ({MAX_CVS_PER_RUN} CVs)")
                 break
 
 
@@ -571,35 +899,40 @@ class HarvesterRelational:
             if not ds_wf: continue
 
 
-            rel_col = self.encontrar_propiedad_relacion(ds_wf)
-            
-            filtro = {
+            rel_col = self.find_relation_property(ds_wf)
+
+            filter_params = {
                 "and": [
                     {"property": PROP_CHECKBOX_PROCESSED, "checkbox": {"equals": False}},
                     {"property": PROP_ID, "rich_text": {"is_not_empty": True}}
                 ]
             }
-            candidatos = self.notion.query_data_source(ds_wf, filtro)
-            
-            if candidatos:
-                self.logger.info(f"Procesando {len(candidatos)} candidatos en '{proc['process_name']}'")
-                stage_init = self.determinar_stage_inicial(ds_wf)
-                for cand in candidatos:
+            candidates = self.notion.query_data_source(ds_wf, filter_params)
+
+            if candidates:
+                self.logger.info(f"Processing {len(candidates)} candidates in '{proc['process_name']}'")
+                self.logger.debug(f"run_once: {len(candidates)} unprocessed candidates in '{proc['process_name']}'")
+                stage_init = self.determine_initial_stage(ds_wf)
+                for cand in candidates:
 
 
-                    if cvs_procesados_hoy >= MAX_CVS_PER_RUN: 
+                    if cvs_processed_today >= MAX_CVS_PER_RUN:
+                        self.logger.debug(f"run_once: safety limit reached ({MAX_CVS_PER_RUN}), stopping early")
                         break
-                    self.procesar_candidato(cand, proc, rel_col, stage_init)
-                    cvs_procesados_hoy += 1
-            
-        self.logger.info("Ejecución completada")
+                    self.process_candidate(cand, proc, rel_col, stage_init)
+                    cvs_processed_today += 1
+
+        # --- STEP 3: REPROCESS AI PENDING ---
+        self._reprocess_ai_pending()
+
+        self.logger.info("Execution completed")
 
 
 if __name__ == "__main__":
     client_notion = NotionClient()
     client_supa = SupabaseManager()
     client_storage = StorageClient()
-    analyzer_ai = AnalizadorCV()
+    analyzer_ai = CVAnalyzer()
 
     exa = None
     try:

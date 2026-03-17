@@ -29,7 +29,6 @@ PROP_EDU_MBAS = "EDUCATION: MBAs"               # Renamed
 # --- OTHER ---
 PROP_LANGUAGES = "Languages"
 PROP_DATE_ADDED = "Date Added" 
-PROP_CULTURAL_FIT = "Assessment" 
 
 
 # --- EXPERIENCE ---
@@ -60,10 +59,25 @@ PROP_ID = "ID"
 PROP_CHECKBOX_PROCESSED = "Processed"
 PROP_STAGE = "Stage"
 PROP_HEADHUNTER = "Headhunter"  # Checkbox in Form DB
+PROP_HEADHUNTER_FEEDBACK = "Headhunter's Feedback"  # File in Workflow DB
 PROP_NEXT_STEPS = "Next Steps"
+PROP_AI_PENDING = "AI Pending"
+PROP_ASSESSMENT_REQUESTED = "Assessment Requested"
 
 
 # --- PROCESS DASHBOARD (FACTORY WORKER) --- <--- NEW BLOCK!
 PROP_READY_TO_PROCESS = "Ready to be Processed [Do not touch]"
 PROP_PROCESSED_DASHBOARD = "Processed [Do not touch]"
 PROP_PROCESS_TYPE = "Process Type"
+
+
+# --- WEBHOOK HANDLER NAMES ---
+HANDLER_PROCESS_LAUNCHER = "process_launcher"
+HANDLER_PROCESS_DASHBOARD = "process_dashboard"
+HANDLER_MAIN_CANDIDATE = "main_candidate"
+HANDLER_CENTRAL_REFERENCE = "central_reference"
+HANDLER_WORKFLOW_ITEM = "workflow_item"
+HANDLER_FEEDBACK_FORM = "feedback_form"
+HANDLER_FORM_SUBMISSION = "form_submission"
+HANDLER_BULK_SUBMISSION = "bulk_submission"
+HANDLER_OUTCOME_FORM = "outcome_form"
