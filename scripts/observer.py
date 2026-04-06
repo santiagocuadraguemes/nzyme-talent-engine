@@ -39,7 +39,9 @@ load_dotenv()
 
 
 # --- CONFIGURATION ---
-LOOKBACK_MINUTES = 25
+# Must be >= EventBridge schedule interval (10 min) to prevent missed changes.
+# 11 min provides a 1-minute overlap buffer. Larger values cause Notion search API timeouts.
+LOOKBACK_MINUTES = int(os.getenv("OBSERVER_LOOKBACK_MINUTES", "11"))
 MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
 PROCESS_DASHBOARD_DB_ID = os.getenv("NOTION_PROCESS_DASHBOARD_DB_ID")
 CENTRAL_REFS_DB_ID = os.getenv("NOTION_REFERENCES_DB_ID")
@@ -211,7 +213,7 @@ class Observer:
                 candidate_id = self._find_candidate_ancestor(p_id, p_type)
 
                 if candidate_id:
-                    self.logger.info(f"[{label}] Processing {len(rows)} entries in '{ds_name}'")
+                    self.logger.info(f"[{label}] Processing {len(rows)} entries in '{ds_name}' (DB: {ds_id[:8]}...)")
                     context = {"candidate_id": candidate_id}
 
                     for page in rows:
@@ -241,6 +243,13 @@ class Observer:
             process_dashboard_page_id = assign_rel[0]["id"]
             self.logger.debug(f"[MAIN_CANDIDATE] Path: dispatch to process {process_dashboard_page_id[:8]}...")
             self.logger.info(f"[DISPATCH] Move request detected to page: {process_dashboard_page_id}")
+
+            # Pre-dispatch Supabase sync: ensure candidate exists before Harvester runs
+            page_id = page["id"]
+            data_update = NotionParser.parse_candidate_properties(props)
+            self.supa.manage_candidate(data_update, page_id)
+            self.logger.debug(f"[DISPATCH] Pre-dispatch Supabase sync complete for {page_id[:8]}...")
+
             self._logic_dispatch_candidate_to_form(page, process_dashboard_page_id)
             return
 
@@ -528,32 +537,51 @@ class Observer:
 
 
     def _handle_outcome_entry(self, page, context):
-        """Handler: Outcome Form (Fuzzy Match + Sync Reason)"""
-        candidate_id = context.get("candidate_id")
-        if not candidate_id: return
-
-
+        """Handler: Outcome Form (Fuzzy Match + Sync Reason). Uses try/finally to always mark Processed."""
         props = page["properties"]
+
+        # Guard: skip if already processed
+        if props.get("Processed", {}).get("checkbox", False):
+            return
+
         page_id = page["id"]
 
+        try:
+            self._process_outcome_inner(page_id, props, context)
+        except Exception as e:
+            self.logger.error(f"[OUTCOME] Unexpected error processing {page_id}: {e}", exc_info=True)
+        finally:
+            try:
+                self.notion.update_page(page_id, {"Processed": {"checkbox": True}})
+            except Exception:
+                self.logger.error(f"[OUTCOME] CRITICAL: Could not mark {page_id} as processed")
 
+    def _process_outcome_inner(self, page_id, props, context):
+        """Inner logic for outcome processing. Exceptions are caught by the caller."""
+        # 1. Validate candidate_id
+        candidate_id = context.get("candidate_id")
+        if not candidate_id:
+            self.logger.warning(f"[OUTCOME] No candidate_id in context for page {page_id}, skipping")
+            return
+
+        # 2. Extract outcome value
         outcome_prop = props.get("Discarded/Disqualified/Lost", {}).get("select")
         outcome_val = outcome_prop["name"] if outcome_prop else None
 
         explanation_obj = props.get("Explanation", {}).get("rich_text", [])
         explanation_val = explanation_obj[0]["plain_text"] if explanation_obj else "No explanation provided"
 
-        self.logger.debug(f"[OUTCOME] outcome_val='{outcome_val}', candidate_id={candidate_id[:8] if candidate_id else None}...")
+        self.logger.debug(f"[OUTCOME] outcome_val='{outcome_val}', candidate_id={candidate_id[:8]}...")
         if not outcome_val:
+            self.logger.warning(f"[OUTCOME] Empty outcome select for page {page_id}, marking as processed")
             return
 
-
+        # 3. Fuzzy match stage name
         final_stage_name = self._fuzzy_match_stage(candidate_id, outcome_val)
-
         self.logger.debug(f"[OUTCOME] Fuzzy match result: '{outcome_val}' -> '{final_stage_name}'")
         self.logger.info(f"Outcome match: '{outcome_val}' -> '{final_stage_name}'")
 
-
+        # 4. Update candidate stage in Notion
         payload_cand = {
             "Stage": {"select": {"name": final_stage_name}},
             PROP_NEXT_STEPS: {"multi_select": []}  # Clear next steps on disqualification
@@ -561,11 +589,11 @@ class Observer:
         res_upd = self.notion.update_page(candidate_id, payload_cand)
 
         if res_upd.status_code == 200:
+            # 5. Sync rejection reason to Supabase
             self.supa.update_rejection_reason(candidate_id, explanation_val, final_stage_name)
-            self.notion.update_page(page_id, {"Processed": {"checkbox": True}})
             self.logger.info("Outcome processed successfully")
         else:
-            self.logger.error(f"Failed to update candidate: {res_upd.text}")
+            self.logger.error(f"[OUTCOME] Failed to update candidate {candidate_id}: {res_upd.text}")
 
 
 
@@ -607,42 +635,68 @@ class Observer:
 
         self.logger.info(f"[ASSESSMENT] Running for '{candidate_name}' — CV={'yes' if cv_text else 'no'}, feedback={len(feedback_texts)} entries")
 
-        # 6. Call AI
-        result = self.ai.process_feedback_assessment(cv_text, feedback_texts, assessment_chars)
-        if not result:
-            self.logger.error(f"[ASSESSMENT] AI failed for '{candidate_name}'.")
-            self._uncheck_assessment_requested(page_id)
-            return
-
-        # 7. Find "Gathered Feedback" child DB
+        # 6. Find "Gathered Feedback" child DB (before AI call to enable dedup check)
         gathered_db_id = self.notion.find_child_database(page_id, "Gathered Feedback")
         if not gathered_db_id:
             self.logger.warning(f"[ASSESSMENT] No 'Gathered Feedback' DB found for '{candidate_name}'.")
             self._uncheck_assessment_requested(page_id)
             return
 
-        # 8. Create assessment page with scored matrix blocks
-        process_name = process_context.get("process_name", "Unknown Process")
+        # 6b. Deduplication: check if assessment already exists
+        ds_gathered = self.notion.get_data_source_id(gathered_db_id) or gathered_db_id
+        existing_pages = self.notion.query_data_source(ds_gathered, filter_params=None)
+        for ep in (existing_pages or []):
+            title_list = ep.get("properties", {}).get("Interviewer", {}).get("title", [])
+            title = title_list[0]["plain_text"] if title_list else ""
+            if "AI-generated" in title:
+                self.logger.info(f"[ASSESSMENT] Assessment already exists for '{candidate_name}'. Skipping.")
+                self._uncheck_assessment_requested(page_id)
+                return
+
+        # 7. Call AI
+        result = self.ai.process_feedback_assessment(cv_text, feedback_texts, assessment_chars)
+        if not result:
+            self.logger.error(f"[ASSESSMENT] AI failed for '{candidate_name}'.")
+            self._uncheck_assessment_requested(page_id)
+            return
+
+        # 8. Create assessment page in Gathered Feedback
         payload = {
-            "Interviewer": {"title": [{"text": {"content": f"Feedback Assessment [AI-generated]"}}]},
+            "Interviewer": {"title": [{"text": {"content": "Feedback Assessment [AI-generated]"}}]},
         }
         res_create = self.notion.create_page(gathered_db_id, payload)
 
-        if res_create.status_code == 200:
-            new_page_id = res_create.json()["id"]
-            blocks = self._build_assessment_blocks(result, process_name)
-            self.logger.info(f"[ASSESSMENT] {len(blocks)} blocks generated for '{candidate_name}'")
-
-            CHUNK_SIZE = 100
-            for i in range(0, len(blocks), CHUNK_SIZE):
-                chunk = blocks[i:i + CHUNK_SIZE]
-                self.notion.append_block_children(new_page_id, chunk)
-
-            self.logger.info(f"[ASSESSMENT] Completed for '{candidate_name}'")
-        else:
+        if res_create.status_code != 200:
             self.logger.error(f"[ASSESSMENT] Error creating page: {res_create.text}")
+            self._uncheck_assessment_requested(page_id)
+            return
 
-        # 9. Uncheck "Assessment Requested"
+        new_page_id = res_create.json()["id"]
+
+        # 9. Build content blocks: summary + assessment table
+        blocks = []
+        process_name = process_context.get("process_name", "Unknown Process")
+
+        summary = result.get("overall_summary", "")
+        if summary:
+            blocks.append({
+                "object": "block", "type": "heading_2",
+                "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"Feedback Assessment — {process_name}"}}]}
+            })
+            blocks.append({
+                "object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": summary}}]}
+            })
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+
+        # 10. Build assessment table block
+        table_block = self._build_assessment_table(assessment_chars, result)
+        blocks.append(table_block)
+
+        self.notion.append_block_children(new_page_id, blocks)
+        self.logger.info(f"[ASSESSMENT] Completed for '{candidate_name}'")
+
+        # 11. Uncheck "Assessment Requested"
         self._uncheck_assessment_requested(page_id)
 
     def _get_cv_text(self, page):
@@ -740,62 +794,68 @@ class Observer:
 
         return "\n".join(lines)
 
-    def _build_assessment_blocks(self, result, process_name):
-        """Builds Notion blocks for the feedback assessment output page."""
-        blocks = []
+    def _build_assessment_table(self, assessment_chars, result):
+        """Builds a Notion table block with the assessment matrix data."""
+        # Build lookup from AI result by characteristic name
+        # Build lookup from AI result — exact match first, then prefix fallback
+        ai_lookup = {}
+        ai_items = result.get("assessment", [])
+        for item in ai_items:
+            name = item.get("characteristic", "")
+            if name:
+                ai_lookup[name.lower()] = item
 
-        # Header
-        blocks.append({
-            "object": "block", "type": "heading_2",
-            "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"Feedback Assessment — {process_name}"}}]}
-        })
+        def _find_ai_data(char_name):
+            key = char_name.lower()
+            # Exact match
+            if key in ai_lookup:
+                return ai_lookup[key]
+            # Fallback: AI may have included the definition after the name
+            for ai_key, ai_item in ai_lookup.items():
+                if ai_key.startswith(key):
+                    return ai_item
+            return {}
 
-        # Overall summary
-        summary = result.get("overall_summary", "")
-        if summary:
-            blocks.append({
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": summary}}]}
-            })
+        # Header row
+        header = {"type": "table_row", "table_row": {"cells": [
+            [{"type": "text", "text": {"content": "Characteristic"}}],
+            [{"type": "text", "text": {"content": "Definition"}}],
+            [{"type": "text", "text": {"content": "Score"}}],
+            [{"type": "text", "text": {"content": "CV Evidence"}}],
+            [{"type": "text", "text": {"content": "Feedback Evidence"}}],
+        ]}}
 
-        blocks.append({"object": "block", "type": "divider", "divider": {}})
+        rows = [header]
 
-        # Per-characteristic sections
-        for item in result.get("assessment", []):
-            char_name = item.get("characteristic", "Unknown")
-            score = item.get("score", "No")
+        for char in assessment_chars:
+            char_name = char.get("characteristic", "")
+            char_def = char.get("definition", "")
+            if not char_name:
+                continue
 
-            # Heading with characteristic name and score
-            blocks.append({
-                "object": "block", "type": "heading_3",
-                "heading_3": {"rich_text": [
-                    {"type": "text", "text": {"content": f"{char_name} — "},
-                     "annotations": {"bold": True}},
-                    {"type": "text", "text": {"content": score}}
-                ]}
-            })
+            ai_data = _find_ai_data(char_name)
+            score = ai_data.get("score", "No")
+            cv_evidence = ai_data.get("cv_evidence", "No CV available")
+            fb_evidence = ai_data.get("feedback_evidence", "No feedback available")
 
-            # CV evidence
-            cv_evidence = item.get("cv_evidence", "No CV available")
-            blocks.append({
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [
-                    {"type": "text", "text": {"content": "CV: "}, "annotations": {"bold": True}},
-                    {"type": "text", "text": {"content": cv_evidence}}
-                ]}
-            })
+            rows.append({"type": "table_row", "table_row": {"cells": [
+                [{"type": "text", "text": {"content": char_name}}],
+                [{"type": "text", "text": {"content": char_def}}],
+                [{"type": "text", "text": {"content": score}}],
+                [{"type": "text", "text": {"content": cv_evidence}}],
+                [{"type": "text", "text": {"content": fb_evidence}}],
+            ]}})
 
-            # Feedback evidence
-            fb_evidence = item.get("feedback_evidence", "No feedback available")
-            blocks.append({
-                "object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [
-                    {"type": "text", "text": {"content": "Feedback: "}, "annotations": {"bold": True}},
-                    {"type": "text", "text": {"content": fb_evidence}}
-                ]}
-            })
-
-        return blocks
+        return {
+            "object": "block",
+            "type": "table",
+            "table": {
+                "table_width": 5,
+                "has_column_header": True,
+                "has_row_header": False,
+                "children": rows,
+            }
+        }
 
     def _uncheck_assessment_requested(self, page_id):
         """Unchecks the 'Assessment Requested' checkbox on a workflow page."""
@@ -1096,6 +1156,11 @@ class Observer:
 
         payload[PROP_CHECKBOX_PROCESSED] = {"checkbox": True}
         self.notion.update_page(page["id"], payload)
+
+        # Sync to Supabase (so Harvester can find via identity resolution)
+        supa_data = DomainMapper.map_to_supabase_candidate(ai_data, public_url)
+        self.supa.manage_candidate(supa_data, page["id"])
+
         self.logger.info("Enrichment completed")
         return True
 

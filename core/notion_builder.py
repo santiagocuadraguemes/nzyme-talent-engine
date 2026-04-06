@@ -195,7 +195,7 @@ class NotionBuilder:
 
         # Source (only set for new candidates)
         if source:
-            props[PROP_SOURCE] = {"rich_text": [{"text": {"content": source}}]}
+            props[PROP_SOURCE] = {"multi_select": [{"name": source, "color": "default"}]}
 
         # Total Years Range
         rango_total = DomainMapper.get_years_range_tag(candidate_data.get("total_years", 0))

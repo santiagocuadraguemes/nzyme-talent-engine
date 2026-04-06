@@ -37,18 +37,24 @@ class NotionClient:
         return None
 
     def get_data_source_id(self, database_id):
-        """Gets the underlying Data Source ID (Vital for 2025 API)."""
+        """Gets the underlying Data Source ID (Vital for 2025 API).
+        Returns None if the database is not accessible (404/403)."""
         url = f"{self.base_url}/databases/{database_id}"
         logger.debug(f"get_data_source_id → db {database_id[:8]}...")
         response = self.client.get(url)
-        logger.debug(f"get_data_source_id ← status {response.status_code}")
         if response.status_code == 200:
             data = response.json()
             sources = data.get("data_sources", [])
             if sources:
                 logger.debug(f"get_data_source_id resolved → ds {sources[0]['id'][:8]}...")
                 return sources[0]["id"]
-        logger.debug("get_data_source_id → no data source resolved")
+            logger.debug("get_data_source_id → no data sources in response")
+            return None
+        if response.status_code == 404:
+            # Could be a data source ID passed directly, or a database not shared with the integration
+            logger.warning(f"get_data_source_id → 404 for {database_id[:8]}... (not shared or not a database ID)")
+        else:
+            logger.warning(f"get_data_source_id → {response.status_code} for {database_id[:8]}...")
         return None
 
 
@@ -80,18 +86,29 @@ class NotionClient:
 
 
     def query_data_source(self, data_source_id, filter_params):
-        """Queries data using the Data Source ID."""
+        """Queries data using the Data Source ID. Handles pagination automatically."""
         url = f"{self.base_url}/data_sources/{data_source_id}/query"
         logger.debug(f"query_data_source → ds {data_source_id[:8]}..., filter={'yes' if filter_params else 'none'}")
         payload = {}
         if filter_params: payload["filter"] = filter_params
 
-        response = self.client.post(url, json=payload)
-        logger.debug(f"query_data_source ← status {response.status_code}")
-        if response.status_code == 200:
-            return response.json().get("results", [])
-        print(f"[API ERROR] Query failed ({response.status_code}): {response.text}")
-        return []
+        all_results = []
+        while True:
+            response = self.client.post(url, json=payload)
+            logger.debug(f"query_data_source ← status {response.status_code}, page_results={len(response.json().get('results', [])) if response.status_code == 200 else 0}")
+            if response.status_code != 200:
+                logger.error(f"[API ERROR] Query failed ({response.status_code}): {response.text}")
+                return all_results  # return whatever we collected so far
+
+            data = response.json()
+            all_results.extend(data.get("results", []))
+
+            if not data.get("has_more"):
+                break
+            payload["start_cursor"] = data["next_cursor"]
+
+        logger.debug(f"query_data_source → total results: {len(all_results)}")
+        return all_results
 
 
     def update_database(self, database_id, title=None):
@@ -165,6 +182,22 @@ class NotionClient:
             logger.error(f"create_page FAILED — db={database_id[:8]}..., props={prop_keys}, status={response.status_code}, body={response.text[:300]}")
         return response
 
+
+    def create_database(self, parent_page_id, title, properties_schema):
+        """Creates a child database inside a page.
+        Returns raw httpx.Response (caller extracts DB ID + data_source_id)."""
+        url = f"{self.base_url}/databases"
+        logger.debug(f"create_database → parent {parent_page_id[:8]}..., title='{title}'")
+        payload = {
+            "parent": {"type": "page_id", "page_id": parent_page_id},
+            "title": [{"type": "text", "text": {"content": title}}],
+            "properties": properties_schema,
+        }
+        response = self.client.post(url, json=payload)
+        logger.debug(f"create_database ← status {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"create_database FAILED — parent={parent_page_id[:8]}..., title='{title}', status={response.status_code}, body={response.text[:300]}")
+        return response
 
     def get_database_schema(self, data_source_id):
         """Reads the properties of a DB."""

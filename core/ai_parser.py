@@ -104,7 +104,7 @@ class CVData(BaseModel):
 
 # --- FEEDBACK ASSESSMENT MODEL (CV + Interview Feedback) ---
 class FeedbackAssessmentItem(BaseModel):
-    characteristic: str = Field(description="The exact name of the characteristic as listed in the instructions.")
+    characteristic: str = Field(description="ONLY the characteristic name (the quoted text before the dash). Example: 'Proactive', NOT 'Proactive — Acts without being told...'.")
     score: StrategicScore = Field(description="The assessment score based on CV and interview feedback evidence.")
     cv_evidence: str = Field(description="Brief evidence from the CV supporting this score (max 20 words). Use 'No CV available' if no CV was provided.")
     feedback_evidence: str = Field(description="Brief evidence from interview feedback supporting this score (max 20 words). Use 'No feedback available' if no feedback was provided.")
@@ -426,7 +426,7 @@ class CVAnalyzer:
 
         num_chars = len(assessment_characteristics)
         char_definitions = "\n".join(
-            f"{i+1}. {item['characteristic']}: {item['definition']}"
+            f"{i+1}. \"{item['characteristic']}\" — {item['definition']}"
             for i, item in enumerate(assessment_characteristics)
         )
 

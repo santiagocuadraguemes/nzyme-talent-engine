@@ -19,6 +19,9 @@ class ExaClient:
         try:
             self.logger.info(f"Fetching LinkedIn profile: {linkedin_url}")
             result = self.client.get_contents(urls=[linkedin_url], text=True)
+            if not result.results:
+                self.logger.warning(f"Exa returned no results for: {linkedin_url}")
+                return None
             text = result.results[0].text
             if not text:
                 self.logger.warning("Exa returned empty text for profile")

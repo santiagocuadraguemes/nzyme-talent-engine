@@ -15,6 +15,7 @@ from core.supabase_client import SupabaseManager
 from core.storage_client import StorageClient
 from core.ai_parser import CVAnalyzer
 from core.notion_builder import NotionBuilder
+from core.notion_parser import NotionParser
 from core.domain_mapper import DomainMapper
 from core.utils import download_file
 from core.constants import (
@@ -354,6 +355,27 @@ class HarvesterRelational:
         page_id = cand["id"]
         props = cand["properties"]
 
+        # 0. Concurrency guard: skip if already processed by another invocation
+        existing_app = self.supa_manager.get_application_by_notion_id(page_id)
+        if existing_app:
+            self.logger.info(f"Already processed by another invocation (workflow page {page_id[:8]}...). Skipping.")
+            self.notion.update_page(page_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
+            return
+
+        try:
+            self._process_candidate_inner(cand, process_entry, relation_col_name, initial_stage)
+        except Exception as e:
+            self.logger.error(f"Unexpected error processing {page_id[:8]}...: {e}", exc_info=True)
+        finally:
+            # Always mark workflow page as processed to prevent infinite reprocessing loops
+            try:
+                self.notion.update_page(page_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
+            except Exception:
+                self.logger.error(f"CRITICAL: Could not mark {page_id[:8]}... as processed")
+
+    def _process_candidate_inner(self, cand, process_entry, relation_col_name, initial_stage):
+        page_id = cand["id"]
+        props = cand["properties"]
         current_process_name = process_entry["process_name"]
         current_process_type = process_entry.get("process_type")
 
@@ -368,6 +390,11 @@ class HarvesterRelational:
                 notion_url, file_name, is_headhunter, form_data = self.find_cv_in_auxiliary(process_entry["notion_form_id"], id_text)
                 if form_data is not None:
                     break
+
+        # Re-check concurrency guard before expensive AI processing
+        if self.supa_manager.get_application_by_notion_id(page_id):
+            self.logger.info(f"Application appeared during setup (race). Skipping AI for {page_id[:8]}...")
+            return  # finally block marks Processed
 
         # Two-path processing: CV vs No-CV
         ai_failed = False
@@ -457,6 +484,31 @@ class HarvesterRelational:
             source=source_to_pass
         )
 
+        # --- 3b. SKELETON GUARD: Don't overwrite existing experience data ---
+        if (ai_failed or needs_ai_pending) and main_notion_id:
+            existing_page = self.notion.get_page(main_notion_id)
+            if existing_page:
+                existing_props = existing_page.get("properties", {})
+                exp_prop_names = [
+                    PROP_EXP_CONSULTING, PROP_EXP_AUDIT, PROP_EXP_IB, PROP_EXP_PE,
+                    PROP_EXP_VC, PROP_EXP_ENGINEER, PROP_EXP_LAWYER, PROP_EXP_FOUNDER,
+                    PROP_EXP_MANAGEMENT, PROP_EXP_CORP_MA, PROP_EXP_PORTCO,
+                    PROP_EXP_FINANCE, PROP_EXP_MARKETING, PROP_EXP_OPERATIONS,
+                    PROP_EXP_PRODUCT, PROP_EXP_SALES_REVENUE, PROP_EXP_TECHNOLOGY,
+                ]
+                has_existing_exp = False
+                for prop_name in exp_prop_names:
+                    tags = NotionParser._extract_tags(existing_props.get(prop_name))
+                    if tags and tags != ["No"]:
+                        has_existing_exp = True
+                        break
+
+                if has_existing_exp:
+                    self.logger.info(f"Skeleton guard: preserving existing experience data on {main_notion_id[:8]}...")
+                    for prop_name in exp_prop_names:
+                        main_props.pop(prop_name, None)
+                    main_props.pop(PROP_EXP_TOTAL_YEARS, None)
+
         # --- 4. WRITE ---
         main_error = False
         main_props[PROP_CHECKBOX_PROCESSED] = {"checkbox": True}
@@ -537,7 +589,6 @@ class HarvesterRelational:
 
         # 7. CLOSE
         update_props = {
-            PROP_CHECKBOX_PROCESSED: {"checkbox": True},
             PROP_NAME: {"title": [{"text": {"content": ai_data["name"]}}]},
         }
         # Only set CV file if we have one
@@ -549,7 +600,6 @@ class HarvesterRelational:
             update_props[relation_col_name] = {"relation": [{"id": main_notion_id}]}
         if initial_stage:
             update_props[PROP_STAGE] = {"select": {"name": initial_stage}}
-
 
         res_close = self.notion.update_page(page_id, update_props)
         if res_close.status_code != 200:

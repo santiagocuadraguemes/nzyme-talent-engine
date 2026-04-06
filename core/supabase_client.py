@@ -38,6 +38,9 @@ class SupabaseManager:
             self.logger.info(f"Process registered: {name}")
             return True
         except Exception as e:
+            if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                self.logger.info(f"Concurrent process insert for '{name}'. Already registered.")
+                return True  # treat as success — process exists
             self.logger.error(f"Failed to register process: {e}")
             return False
 
@@ -129,13 +132,20 @@ class SupabaseManager:
 
 
         except Exception as e:
+            if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                # Concurrent insert — fetch the row that won the race
+                self.logger.info(f"Concurrent candidate insert for {notion_page_id[:8]}..., fetching existing")
+                existing = self.client.table("NzymeTalentNetwork") \
+                    .select("id").eq("notion_page_id", notion_page_id).execute()
+                if existing.data:
+                    return existing.data[0]['id']
             self.logger.error(f"Failed to manage candidate: {e}", exc_info=True)
             return None
 
 
     # --- APPLICATION MANAGEMENT ---
     def create_application(self, candidate_uuid, notion_wf_id, notion_page_id, initial_stage):
-        """Creates or upserts an application. Returns the application UUID on success, None on failure."""
+        """Creates an application. Returns existing app ID if already exists (no overwrite). Returns None on failure."""
         try:
             proc_res = self.client.table("NzymeRecruitingProcesses").select("id").eq("notion_workflow_id", notion_wf_id).execute()
             if not proc_res.data:
@@ -144,7 +154,15 @@ class SupabaseManager:
             process_uuid = proc_res.data[0]['id']
             self.logger.debug(f"create_application: resolved process_uuid {process_uuid[:8]}...")
 
+            # Check if application already exists (don't overwrite current_stage)
+            existing = self.client.table("NzymeRecruitingApplications") \
+                .select("id").eq("candidate_id", candidate_uuid) \
+                .eq("process_id", process_uuid).execute()
+            if existing.data:
+                self.logger.info(f"Application already exists: {existing.data[0]['id'][:8]}...")
+                return existing.data[0]['id']
 
+            # INSERT new application
             app_data = {
                 "candidate_id": candidate_uuid,
                 "process_id": process_uuid,
@@ -152,15 +170,19 @@ class SupabaseManager:
                 "current_stage": initial_stage,
                 "status": "Active"
             }
-            res = self.client.table("NzymeRecruitingApplications").upsert(
-                app_data, on_conflict="candidate_id, process_id"
-            ).execute()
+            res = self.client.table("NzymeRecruitingApplications").insert(app_data).execute()
             if res.data:
                 app_id = res.data[0]["id"]
                 self.logger.debug(f"create_application: success — app_id {app_id[:8]}...")
                 return app_id
             return None
         except Exception as e:
+            if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                self.logger.info(f"Concurrent insert detected, fetching existing application")
+                existing = self.client.table("NzymeRecruitingApplications") \
+                    .select("id").eq("candidate_id", candidate_uuid) \
+                    .eq("process_id", process_uuid).execute()
+                return existing.data[0]['id'] if existing.data else None
             self.logger.error(f"Failed to create application: {e}")
             return None
 
@@ -177,12 +199,17 @@ class SupabaseManager:
     def register_stage_change(self, app_id, old_stage, new_stage):
         try:
             self.logger.debug(f"register_stage_change: app {app_id[:8]}... — '{old_stage}' -> '{new_stage}'")
-            self.client.table("NzymeRecruitingApplications").update({
+            # Optimistic lock: only update if stage hasn't changed since we read it
+            res = self.client.table("NzymeRecruitingApplications").update({
                 "current_stage": new_stage,
                 "updated_at": "now()"
-            }).eq("id", app_id).execute()
+            }).eq("id", app_id).eq("current_stage", old_stage).execute()
 
+            if not res.data:
+                self.logger.info(f"Stage already changed (optimistic lock): {old_stage} -> {new_stage}")
+                return False
 
+            # Only insert history if we won the update
             self.client.table("NzymeRecruitingProcessHistory").insert({
                 "application_id": app_id,
                 "from_stage": old_stage,

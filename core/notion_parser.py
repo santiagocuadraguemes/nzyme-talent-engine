@@ -7,6 +7,8 @@ from core.constants import (
     PROP_EXP_CONSULTING, PROP_EXP_AUDIT, PROP_EXP_IB, PROP_EXP_PE,
     PROP_EXP_VC, PROP_EXP_ENGINEER, PROP_EXP_LAWYER, PROP_EXP_FOUNDER,
     PROP_EXP_MANAGEMENT, PROP_EXP_CORP_MA, PROP_EXP_PORTCO,
+    PROP_EXP_FINANCE, PROP_EXP_MARKETING, PROP_EXP_OPERATIONS,
+    PROP_EXP_PRODUCT, PROP_EXP_SALES_REVENUE, PROP_EXP_TECHNOLOGY,
     PROP_EXP_INTERNATIONAL, PROP_EXP_INDUSTRIES,
     PROP_EDU_BACHELORS, PROP_EDU_MASTERS, PROP_EDU_UNIVERSITIES,
     PROP_EDU_MBAS,
@@ -68,9 +70,12 @@ class NotionParser:
 
         # --- NEW SQL FIELDS ---
 
-        # Creator and Source are TEXT in Notion
-        data["creator"] = NotionParser._extract_text(notion_props.get(PROP_CREATOR))
-        data["source"] = NotionParser._extract_text(notion_props.get(PROP_SOURCE))
+        # Creator and Source are MULTI-SELECT in Notion
+        tags_creator = NotionParser._extract_tags(notion_props.get(PROP_CREATOR))
+        data["creator"] = ", ".join(tags_creator) if tags_creator else None
+
+        tags_source = NotionParser._extract_tags(notion_props.get(PROP_SOURCE))
+        data["source"] = ", ".join(tags_source) if tags_source else None
         
         # Assessment is TAG in Notion -> Convert to String for SQL
         tags_assessment = NotionParser._extract_tags(notion_props.get(PROP_ASSESSMENT))
@@ -104,7 +109,13 @@ class NotionParser:
             PROP_EXP_FOUNDER: "founder",
             PROP_EXP_MANAGEMENT: "management",
             PROP_EXP_CORP_MA: "corp_ma",
-            PROP_EXP_PORTCO: "portco_roles"
+            PROP_EXP_PORTCO: "portco_roles",
+            PROP_EXP_FINANCE: "finance",
+            PROP_EXP_MARKETING: "marketing",
+            PROP_EXP_OPERATIONS: "operations",
+            PROP_EXP_PRODUCT: "product",
+            PROP_EXP_SALES_REVENUE: "sales_revenue",
+            PROP_EXP_TECHNOLOGY: "technology",
         }
 
         candidate_data_json = {

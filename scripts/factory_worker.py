@@ -153,6 +153,13 @@ class FactoryWorkerV2:
             self.logger.error(f"Error extracting data: {e}", exc_info=True)
             return
 
+        # 1b. Concurrency guard: skip if process already registered
+        existing = self.supa.get_process_by_name(process_name)
+        if existing:
+            self.logger.info(f"Process '{process_name}' already in Supabase. Marking processed.")
+            self.notion.update_page(page_id, {PROP_PROCESSED_DASHBOARD: {"checkbox": True}})
+            return
+
         # 2. Safety wait + 3. Identify child DBs (with retry for template propagation)
         wf_db_id = None
         form_db_id = None
