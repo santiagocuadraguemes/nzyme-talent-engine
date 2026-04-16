@@ -11,6 +11,12 @@ load_dotenv()
 logger = get_logger("NotionClient")
 
 
+def get_all_team_group_ids():
+    """Returns list of all team Notion permission group IDs from NOTION_ALL_TEAM_GROUP_IDS env var."""
+    raw = os.getenv("NOTION_ALL_TEAM_GROUP_IDS", "")
+    return [gid.strip() for gid in raw.split(",") if gid.strip()]
+
+
 class NotionClient:
     def __init__(self):
         self.token = os.getenv("NOTION_KEY")

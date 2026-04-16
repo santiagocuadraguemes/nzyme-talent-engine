@@ -12,6 +12,7 @@ PROP_CV_FILES = "CV"
 PROP_CREATOR = "Creator"
 PROP_SOURCE = "Source"
 PROP_ASSESSMENT = "Assessment"
+PROP_CONFIDENTIAL_RELATION = "Relation to Main DB"
 
 
 # --- CLASSIFICATION AND PROCESS ---
@@ -65,10 +66,12 @@ PROP_AI_PENDING = "AI Pending"
 PROP_ASSESSMENT_REQUESTED = "Assessment Requested"
 
 
-# --- PROCESS DASHBOARD (FACTORY WORKER) --- <--- NEW BLOCK!
+# --- PROCESS DASHBOARD (FACTORY WORKER) ---
 PROP_READY_TO_PROCESS = "Ready to be Processed [Do not touch]"
 PROP_PROCESSED_DASHBOARD = "Processed [Do not touch]"
 PROP_PROCESS_TYPE = "Process Type"
+PROP_PROCESS_VISIBILITY = "Process Visibility"                    # Select: "Standard" | "Confidential"
+PROP_GOVERNANCE_ACCESS = "Governance: Edit & View Access"         # People property (Dashboard + Main DB)
 
 
 # --- FEEDBACK ASSESSMENT CHILD DB ---
@@ -89,3 +92,7 @@ HANDLER_FEEDBACK_FORM = "feedback_form"
 HANDLER_FORM_SUBMISSION = "form_submission"
 HANDLER_BULK_SUBMISSION = "bulk_submission"
 HANDLER_OUTCOME_FORM = "outcome_form"
+
+
+# --- DIRECT ENTRY ---
+SOURCE_DIRECT_ENTRY_PREFIX = "Direct Entry"

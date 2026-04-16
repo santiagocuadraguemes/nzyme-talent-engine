@@ -21,7 +21,7 @@ class SupabaseManager:
 
 
     # --- PROCESS MANAGEMENT ---
-    def register_process(self, notion_wf_id, notion_form_id, bulk_id, feedback_id, name, process_type, matrix_characteristics=None, assessment_characteristics=None):
+    def register_process(self, notion_wf_id, notion_form_id, bulk_id, feedback_id, name, process_type, matrix_characteristics=None, assessment_characteristics=None, is_confidential=False, governance_people=None):
         data = {
             "notion_workflow_id": notion_wf_id,
             "notion_form_id": notion_form_id,
@@ -31,7 +31,9 @@ class SupabaseManager:
             "process_type": process_type,
             "status": "Open",
             "matrix_characteristics": matrix_characteristics,
-            "assessment_characteristics": assessment_characteristics
+            "assessment_characteristics": assessment_characteristics,
+            "is_confidential": is_confidential,
+            "governance_people": governance_people
         }
         try:
             self.client.table("NzymeRecruitingProcesses").insert(data).execute()
@@ -65,6 +67,43 @@ class SupabaseManager:
         except Exception as e:
             self.logger.error(f"Failed to update process: {e}")
             return False
+
+
+    def get_active_confidential_processes_for_candidate(self, candidate_id):
+        """Returns governance_people lists for all active confidential processes this candidate is in."""
+        try:
+            apps = self.client.table("NzymeRecruitingApplications") \
+                .select("process_id") \
+                .eq("candidate_id", candidate_id) \
+                .execute()
+            if not apps.data:
+                return []
+            process_ids = [a["process_id"] for a in apps.data if a.get("process_id")]
+            result = []
+            for pid in process_ids:
+                proc = self.client.table("NzymeRecruitingProcesses") \
+                    .select("is_confidential, governance_people") \
+                    .eq("id", pid).eq("status", "Open").eq("is_confidential", True) \
+                    .execute()
+                if proc.data and proc.data[0].get("governance_people"):
+                    result.append(proc.data[0]["governance_people"])
+            return result
+        except Exception as e:
+            self.logger.error(f"Error checking confidential processes for candidate {candidate_id[:8]}...: {e}")
+            return []
+
+
+    def get_applications_for_process(self, process_id):
+        """Returns all applications for a process (for backfilling on process close)."""
+        try:
+            apps = self.client.table("NzymeRecruitingApplications") \
+                .select("*, candidate_id") \
+                .eq("process_id", process_id) \
+                .execute()
+            return apps.data if apps.data else []
+        except Exception as e:
+            self.logger.error(f"Error fetching applications for process {process_id[:8]}...: {e}")
+            return []
 
 
     # --- CANDIDATE MANAGEMENT (IDENTITY ENGINE) ---
@@ -254,6 +293,46 @@ class SupabaseManager:
         except Exception as e:
             self.logger.error(f"Error saving rejection reason: {e}")
             return False
+
+    def get_outcome_context(self, workflow_page_id):
+        """Gets process name and candidate info for creating a Confidential Assessment after outcome processing."""
+        try:
+            # 1. Get application by workflow page ID
+            app_res = self.client.table("NzymeRecruitingApplications") \
+                .select("candidate_id, process_id") \
+                .eq("notion_page_id", workflow_page_id) \
+                .execute()
+            if not app_res.data:
+                self.logger.warning(f"get_outcome_context: no application for workflow page {workflow_page_id[:8]}...")
+                return None
+
+            candidate_id = app_res.data[0]["candidate_id"]
+            process_id = app_res.data[0]["process_id"]
+
+            # 2. Get process name
+            proc_res = self.client.table("NzymeRecruitingProcesses") \
+                .select("process_name") \
+                .eq("id", process_id) \
+                .execute()
+            process_name = proc_res.data[0]["process_name"] if proc_res.data else None
+
+            # 3. Get candidate Main DB page ID and name
+            cand_res = self.client.table("NzymeTalentNetwork") \
+                .select("notion_page_id, name") \
+                .eq("id", candidate_id) \
+                .execute()
+            if not cand_res.data:
+                self.logger.warning(f"get_outcome_context: no candidate found for id {candidate_id[:8]}...")
+                return None
+
+            return {
+                "process_name": process_name,
+                "main_db_page_id": cand_res.data[0]["notion_page_id"],
+                "candidate_name": cand_res.data[0]["name"]
+            }
+        except Exception as e:
+            self.logger.error(f"Error in get_outcome_context: {e}")
+            return None
 
     def resolve_candidate_identity(self, input_email, input_name):
         """

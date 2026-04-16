@@ -13,6 +13,7 @@ from core.constants import (
     PROP_EXP_TECHNOLOGY, PROP_EXP_INTERNATIONAL, PROP_EXP_INDUSTRIES,
     PROP_LANGUAGES, PROP_EDU_BACHELORS, PROP_EDU_MASTERS,
     PROP_EDU_UNIVERSITIES, PROP_EDU_MBAS,
+    PROP_GOVERNANCE_ACCESS,
 )
 
 logger = get_logger("NotionBuilder")
@@ -152,7 +153,7 @@ class NotionBuilder:
     # --- MAIN BUILD METHOD ---
 
     @staticmethod
-    def build_candidate_payload(candidate_data, public_cv_url, process_name, existing_history=None, process_type=None, existing_team_role=None, source=None):
+    def build_candidate_payload(candidate_data, public_cv_url, process_name, existing_history=None, process_type=None, existing_team_role=None, source=None, governance_entries=None, skip_process_history=False):
         """
         Builds the request body for Creating/Updating a page in Notion.
         """
@@ -160,9 +161,9 @@ class NotionBuilder:
         edu = candidate_data.get("education", {})
         gen = candidate_data.get("general", {})
         
-        # 1. Process History Management
+        # 1. Process History Management (skip for confidential processes)
         history_list = existing_history if existing_history else []
-        if process_name and process_name not in history_list:
+        if process_name and process_name not in history_list and not skip_process_history:
             history_list.append(process_name)
         history_tags = [{"name": p, "color": "default"} for p in history_list[-100:]]
 
@@ -196,6 +197,11 @@ class NotionBuilder:
         # Source (only set for new candidates)
         if source:
             props[PROP_SOURCE] = {"multi_select": [{"name": source, "color": "default"}]}
+
+        # Governance (people property for page-level access control)
+        # governance_entries: list of {"object": "user"/"group", "id": "..."} dicts
+        if governance_entries is not None:
+            props[PROP_GOVERNANCE_ACCESS] = {"people": governance_entries}
 
         # Total Years Range
         rango_total = DomainMapper.get_years_range_tag(candidate_data.get("total_years", 0))

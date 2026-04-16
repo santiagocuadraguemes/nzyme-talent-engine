@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
 from core.guidelines_parser import GuidelinesParser
-from core.constants import PROP_READY_TO_PROCESS, PROP_PROCESSED_DASHBOARD, PROP_NAME, PROP_PROCESS_TYPE
+from core.constants import PROP_READY_TO_PROCESS, PROP_PROCESSED_DASHBOARD, PROP_NAME, PROP_PROCESS_TYPE, PROP_PROCESS_VISIBILITY, PROP_GOVERNANCE_ACCESS
 from core.logger import get_logger
 
 load_dotenv()
@@ -147,8 +147,19 @@ class FactoryWorkerV2:
 
             is_portco = "PortCo" in process_type
 
-            self.logger.debug(f"configure_process: name='{process_name}', type='{process_type}', is_portco={is_portco}")
-            self.logger.info(f"Configuring: {process_name} ({process_type})")
+            # 1c. Read confidentiality settings
+            vis_select = props.get(PROP_PROCESS_VISIBILITY, {}).get("select")
+            is_confidential = bool(vis_select and vis_select.get("name") == "Confidential")
+            governance_people = None
+            if is_confidential:
+                people_list = props.get(PROP_GOVERNANCE_ACCESS, {}).get("people", [])
+                governance_people = [p["id"] for p in people_list if p.get("id")]
+                if not governance_people:
+                    self.logger.warning(f"Confidential process '{process_name}' has empty governance — skipping confidential flag")
+                    is_confidential = False
+
+            self.logger.debug(f"configure_process: name='{process_name}', type='{process_type}', is_portco={is_portco}, confidential={is_confidential}")
+            self.logger.info(f"Configuring: {process_name} ({process_type}){' [CONFIDENTIAL]' if is_confidential else ''}")
         except Exception as e:
             self.logger.error(f"Error extracting data: {e}", exc_info=True)
             return
@@ -306,7 +317,9 @@ class FactoryWorkerV2:
             process_name,
             process_type,
             matrix_characteristics=matrix_chars,
-            assessment_characteristics=assessment_chars
+            assessment_characteristics=assessment_chars,
+            is_confidential=is_confidential,
+            governance_people=governance_people
         )
 
         # 10. CLOSE

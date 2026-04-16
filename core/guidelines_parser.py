@@ -154,7 +154,7 @@ class GuidelinesParser:
             "last_edited_time", "parent", "archived", "in_trash",
             "request_id", "has_children"
         }
-        return {k: v for k, v in block.items() if k not in PROPS_READONLY}
+        return {k: v for k, v in block.items() if k not in PROPS_READONLY and v is not None}
 
 
     def _sanitize_rich_text(self, rich_text_obj):

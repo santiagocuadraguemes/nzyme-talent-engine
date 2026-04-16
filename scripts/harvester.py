@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-from core.notion_client import NotionClient
+from core.notion_client import NotionClient, get_all_team_group_ids
 from core.supabase_client import SupabaseManager
 from core.storage_client import StorageClient
 from core.ai_parser import CVAnalyzer
@@ -28,6 +28,7 @@ from core.constants import (
     PROP_EXP_SALES_REVENUE, PROP_EXP_TECHNOLOGY, PROP_EXP_INTERNATIONAL,
     PROP_EXP_INDUSTRIES, PROP_LANGUAGES, PROP_EDU_BACHELORS, PROP_EDU_MASTERS,
     PROP_EDU_UNIVERSITIES, PROP_EDU_MBAS,
+    SOURCE_DIRECT_ENTRY_PREFIX,
 )
 from core.logger import get_logger
 
@@ -474,6 +475,28 @@ class HarvesterRelational:
         source_to_pass = source_value if should_set_source else None
         self.logger.info(f"Source tracking: is_new={is_new_candidate}, existing_source={existing_source}, should_set={should_set_source}, passing={source_to_pass}")
 
+        # --- 3a. GOVERNANCE: Determine access control for Main DB page ---
+        is_confidential = process_entry.get("is_confidential", False)
+        process_governance = process_entry.get("governance_people")
+
+        if is_confidential:
+            governance_ids = set(process_governance or [])
+            if cand_db:
+                for people_list in self.supa_manager.get_active_confidential_processes_for_candidate(cand_db["id"]):
+                    governance_ids.update(people_list)
+            governance_entries = [{"object": "user", "id": uid} for uid in governance_ids]
+            self.logger.info(f"Confidential process — restricting governance to {len(governance_entries)} users")
+        else:
+            if cand_db:
+                other_conf = self.supa_manager.get_active_confidential_processes_for_candidate(cand_db["id"])
+                if other_conf:
+                    governance_entries = None  # don't touch — candidate is in a confidential process
+                    self.logger.info("Non-confidential process but candidate is in a confidential process — preserving governance")
+                else:
+                    governance_entries = [{"object": "group", "id": gid} for gid in get_all_team_group_ids()]
+            else:
+                governance_entries = [{"object": "group", "id": gid} for gid in get_all_team_group_ids()]
+
         main_props = NotionBuilder.build_candidate_payload(
             ai_data,
             public_url,
@@ -481,7 +504,9 @@ class HarvesterRelational:
             existing_history=previous_history,
             process_type=current_process_type,
             existing_team_role=previous_team_role,
-            source=source_to_pass
+            source=source_to_pass,
+            governance_entries=governance_entries,
+            skip_process_history=is_confidential
         )
 
         # --- 3b. SKELETON GUARD: Don't overwrite existing experience data ---
@@ -552,7 +577,8 @@ class HarvesterRelational:
                 json_payload["ai_pending_process_name"] = current_process_name
 
             full_history = list(previous_history)
-            if current_process_name not in full_history: full_history.append(current_process_name)
+            if current_process_name not in full_history:
+                full_history.append(current_process_name)
             json_payload["recruiting_processes_history"] = full_history
 
 
@@ -698,21 +724,9 @@ class HarvesterRelational:
             notion_page_id = page["id"]
             props = page.get("properties", {})
 
-            # 2. Extract CV URL from Notion page's CV file property
-            cv_files = props.get(PROP_CV_FILES, {}).get("files", [])
-            cv_url = None
-            if cv_files:
-                first_file = cv_files[0]
-                cv_url = first_file.get("external", {}).get("url") or first_file.get("file", {}).get("url")
-
             candidate_name = self._extract_title(props.get(PROP_NAME, {})) or "Unknown"
 
-            if not cv_url:
-                self.logger.warning(f"Skipping AI-pending candidate {candidate_name}: no CV URL in Notion")
-                continue
-            self.logger.debug(f"AI-pending {candidate_name}: CV URL found ({cv_url[:40]}...)")
-
-            # 3. Look up candidate in Supabase to get UUID and existing JSONB
+            # 2. Look up candidate in Supabase to get UUID, JSONB, and application info
             candidate = self.supa_manager.get_candidate_by_notion_page_id(notion_page_id)
             if not candidate:
                 self.logger.warning(f"Skipping AI-pending candidate {candidate_name}: not found in Supabase")
@@ -720,7 +734,7 @@ class HarvesterRelational:
 
             cand_json = candidate.get("candidate_data") or {}
 
-            # 4. Get matrix_characteristics and workflow page ID from applications
+            # 3. Get matrix_characteristics and workflow page ID from applications
             matrix_chars = None
             workflow_page_id = None
             applications = self.supa_manager.get_applications_by_candidate_id(candidate["id"])
@@ -728,6 +742,41 @@ class HarvesterRelational:
                 latest_app = applications[0]  # Already ordered by created_at desc
                 matrix_chars = latest_app.get("matrix_characteristics")
                 workflow_page_id = latest_app.get("notion_page_id")
+
+            # 4. Extract CV URL from Main DB page's CV file property
+            cv_files = props.get(PROP_CV_FILES, {}).get("files", [])
+            cv_url = None
+            if cv_files:
+                first_file = cv_files[0]
+                cv_url = first_file.get("external", {}).get("url") or first_file.get("file", {}).get("url")
+
+            # Fallback: check Workflow page for CV (handles direct-entry cases where CV was added after processing)
+            if not cv_url and workflow_page_id:
+                try:
+                    wf_page = self.notion.get_page(workflow_page_id)
+                    if wf_page:
+                        wf_cv_files = wf_page.get("properties", {}).get(PROP_CV_FILES, {}).get("files", [])
+                        if wf_cv_files:
+                            wf_file = wf_cv_files[0]
+                            wf_cv_url = wf_file.get("file", {}).get("url") or wf_file.get("external", {}).get("url")
+                            if wf_cv_url:
+                                self.logger.info(f"AI-pending {candidate_name}: CV found on Workflow page (fallback)")
+                                # Upload to permanent storage and set on Main DB page
+                                wf_file_name = wf_file.get("name", "cv.pdf")
+                                public_url = self.storage.upload_cv_from_url(wf_cv_url, wf_file_name)
+                                if public_url:
+                                    cv_url = public_url
+                                    cv_display = f"CV - {candidate_name}"
+                                    self.notion.update_page(notion_page_id, {
+                                        PROP_CV_FILES: {"files": [{"name": cv_display, "external": {"url": public_url}}]}
+                                    })
+                except Exception as e:
+                    self.logger.warning(f"Error checking Workflow page CV for {candidate_name}: {e}")
+
+            if not cv_url:
+                self.logger.warning(f"Skipping AI-pending candidate {candidate_name}: no CV URL in Notion or Workflow")
+                continue
+            self.logger.debug(f"AI-pending {candidate_name}: CV URL found ({cv_url[:40]}...)")
 
             # 5. Download CV from permanent storage URL
             safe_name = cv_url.split("/")[-1] if "/" in cv_url else "temp_cv"
@@ -920,6 +969,297 @@ class HarvesterRelational:
         for cand in candidates[:MAX_CVS_PER_RUN]:
             self.process_candidate(cand, process_context, rel_col, stage_init)
 
+
+    # --- DIRECT ENTRY PROCESSING (Step 2.5) ---
+
+    def _process_direct_candidates(self, processes, cvs_processed):
+        """
+        Step 2.5: Process candidates added directly to Workflow DBs (no Form entry).
+        These pages have Processed=false, empty ID field, and a non-empty Name.
+        """
+        for proc in processes:
+            if cvs_processed >= MAX_CVS_PER_RUN:
+                break
+
+            wf_db_id = proc["notion_workflow_id"]
+            ds_wf = self.notion.get_data_source_id(wf_db_id)
+            if not ds_wf:
+                continue
+
+            # Complementary filter to standard processing (ID is_empty vs is_not_empty)
+            filter_params = {
+                "and": [
+                    {"property": PROP_CHECKBOX_PROCESSED, "checkbox": {"equals": False}},
+                    {"property": PROP_ID, "rich_text": {"is_empty": True}},
+                    {"property": PROP_NAME, "title": {"is_not_empty": True}}
+                ]
+            }
+            candidates = self.notion.query_data_source(ds_wf, filter_params)
+
+            if not candidates:
+                continue
+
+            self.logger.info(f"[DIRECT] {len(candidates)} direct-entry candidate(s) in '{proc['process_name']}'")
+
+            rel_col = self.find_relation_property(ds_wf)
+            stage_init = self.determine_initial_stage(ds_wf)
+
+            for cand in candidates:
+                if cvs_processed >= MAX_CVS_PER_RUN:
+                    break
+                self._process_direct_candidate(cand, proc, rel_col, stage_init)
+                cvs_processed += 1
+
+        return cvs_processed
+
+
+    def _process_direct_candidate(self, cand, process_entry, relation_col_name, initial_stage):
+        """Wrapper with try/finally for direct-entry candidates (mirrors process_candidate pattern)."""
+        page_id = cand["id"]
+
+        # Concurrency guard
+        existing_app = self.supa_manager.get_application_by_notion_id(page_id)
+        if existing_app:
+            self.logger.info(f"[DIRECT] Already processed (workflow page {page_id[:8]}...). Skipping.")
+            self.notion.update_page(page_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
+            return
+
+        try:
+            self._process_direct_candidate_inner(cand, process_entry, relation_col_name, initial_stage)
+        except Exception as e:
+            self.logger.error(f"[DIRECT] Error processing {page_id[:8]}...: {e}", exc_info=True)
+        finally:
+            try:
+                self.notion.update_page(page_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
+            except Exception:
+                self.logger.error(f"[DIRECT] CRITICAL: Could not mark {page_id[:8]}... as processed")
+
+
+    def _process_direct_candidate_inner(self, cand, process_entry, relation_col_name, initial_stage):
+        """Inner processing logic for candidates added directly to Workflow DB (bypassing Form)."""
+        page_id = cand["id"]
+        props = cand["properties"]
+        current_process_name = process_entry["process_name"]
+        current_process_type = process_entry.get("process_type")
+
+        # 1. Extract data from Workflow page (NOT from Form)
+        name = self._extract_title(props.get(PROP_NAME, {}))
+        if not name:
+            self.logger.warning(f"[DIRECT] Empty name on page {page_id[:8]}..., skipping")
+            return
+
+        creator_name = cand.get("created_by", {}).get("name", "Unknown")
+        source_value = f"{SOURCE_DIRECT_ENTRY_PREFIX} - {creator_name}"
+
+        # Preserve existing stage if already set (don't override manual stage placement)
+        stage_prop = props.get(PROP_STAGE, {})
+        existing_stage = None
+        if stage_prop.get("select"):
+            existing_stage = stage_prop["select"]["name"]
+        elif stage_prop.get("status"):
+            existing_stage = stage_prop["status"]["name"]
+        effective_stage = existing_stage or initial_stage
+
+        cv_files = props.get(PROP_CV_FILES, {}).get("files", [])
+        notion_url = None
+        file_name = None
+        if cv_files:
+            file_obj = cv_files[0]
+            notion_url = file_obj.get("file", {}).get("url") or file_obj.get("external", {}).get("url")
+            file_name = file_obj.get("name", "cv.pdf")
+
+        # Re-check concurrency guard before expensive AI processing
+        if self.supa_manager.get_application_by_notion_id(page_id):
+            self.logger.info(f"[DIRECT] Race detected for {page_id[:8]}...")
+            return
+
+        # 2. Process CV or create minimal record
+        ai_failed = False
+        needs_ai_pending = False
+        public_url = None
+
+        if notion_url:
+            self.logger.debug(f"[DIRECT] Processing with CV ({file_name})")
+            ai_data, public_url, ai_failed = self._process_with_cv(notion_url, file_name, process_entry)
+            if not ai_data and not ai_failed:
+                return  # download/upload failed
+            if ai_failed:
+                self.logger.warning(f"[DIRECT] AI failed for {file_name}. Creating skeleton.")
+                ai_data = self._create_minimal_candidate_data({"name": name, "email": None, "linkedin_url": None})
+        else:
+            self.logger.info(f"[DIRECT] No CV for '{name}'. Creating minimal record, marking AI Pending.")
+            ai_data = self._create_minimal_candidate_data({"name": name, "email": None, "linkedin_url": None})
+            needs_ai_pending = True
+
+        # 3. Identity resolution
+        self.logger.debug(f"[DIRECT] Resolving identity for: {ai_data['name']}")
+        cand_db, main_notion_id = self.supa_manager.resolve_candidate_identity(ai_data.get("email"), ai_data["name"])
+
+        if cand_db and not ai_data.get("email"):
+            self.logger.warning(f"[DIRECT] Name-only merge for '{ai_data['name']}' — verify candidate identity")
+
+        previous_history = []
+        previous_team_role = []
+
+        is_new_candidate = (cand_db is None)
+        existing_source = cand_db.get("source") if cand_db else None
+        should_set_source = is_new_candidate or (not existing_source)
+
+        if cand_db:
+            self.logger.info(f"[DIRECT] Existing candidate (ID: {main_notion_id}). Merging data")
+            cand_json = cand_db.get("candidate_data") or {}
+            previous_history = cand_json.get("recruiting_processes_history", [])
+            previous_team_role = cand_json.get("proposed_teams_roles", [])
+        else:
+            self.logger.info(f"[DIRECT] New candidate (Source: {source_value})")
+
+        source_to_pass = source_value if should_set_source else None
+
+        # 3b. GOVERNANCE: Determine access control for Main DB page
+        is_confidential = process_entry.get("is_confidential", False)
+        process_governance = process_entry.get("governance_people")
+
+        if is_confidential:
+            governance_ids = set(process_governance or [])
+            if cand_db:
+                for people_list in self.supa_manager.get_active_confidential_processes_for_candidate(cand_db["id"]):
+                    governance_ids.update(people_list)
+            governance_entries = [{"object": "user", "id": uid} for uid in governance_ids]
+            self.logger.info(f"[DIRECT] Confidential process — restricting governance to {len(governance_entries)} users")
+        else:
+            if cand_db:
+                other_conf = self.supa_manager.get_active_confidential_processes_for_candidate(cand_db["id"])
+                if other_conf:
+                    governance_entries = None
+                    self.logger.info("[DIRECT] Non-confidential but candidate is in confidential process — preserving governance")
+                else:
+                    governance_entries = [{"object": "group", "id": gid} for gid in get_all_team_group_ids()]
+            else:
+                governance_entries = [{"object": "group", "id": gid} for gid in get_all_team_group_ids()]
+
+        # 4. Build Main DB payload
+        main_props = NotionBuilder.build_candidate_payload(
+            ai_data,
+            public_url,
+            current_process_name,
+            existing_history=previous_history,
+            process_type=current_process_type,
+            existing_team_role=previous_team_role,
+            source=source_to_pass,
+            governance_entries=governance_entries,
+            skip_process_history=is_confidential
+        )
+
+        # Skeleton guard: don't overwrite existing experience data
+        if (ai_failed or needs_ai_pending) and main_notion_id:
+            existing_page = self.notion.get_page(main_notion_id)
+            if existing_page:
+                existing_props = existing_page.get("properties", {})
+                exp_prop_names = [
+                    PROP_EXP_CONSULTING, PROP_EXP_AUDIT, PROP_EXP_IB, PROP_EXP_PE,
+                    PROP_EXP_VC, PROP_EXP_ENGINEER, PROP_EXP_LAWYER, PROP_EXP_FOUNDER,
+                    PROP_EXP_MANAGEMENT, PROP_EXP_CORP_MA, PROP_EXP_PORTCO,
+                    PROP_EXP_FINANCE, PROP_EXP_MARKETING, PROP_EXP_OPERATIONS,
+                    PROP_EXP_PRODUCT, PROP_EXP_SALES_REVENUE, PROP_EXP_TECHNOLOGY,
+                ]
+                has_existing_exp = False
+                for prop_name in exp_prop_names:
+                    tags = NotionParser._extract_tags(existing_props.get(prop_name))
+                    if tags and tags != ["No"]:
+                        has_existing_exp = True
+                        break
+
+                if has_existing_exp:
+                    self.logger.info(f"[DIRECT] Skeleton guard: preserving existing experience on {main_notion_id[:8]}...")
+                    for prop_name in exp_prop_names:
+                        main_props.pop(prop_name, None)
+                    main_props.pop(PROP_EXP_TOTAL_YEARS, None)
+
+        # 5. Write Main DB page
+        main_props[PROP_CHECKBOX_PROCESSED] = {"checkbox": True}
+        if ai_failed or needs_ai_pending:
+            main_props[PROP_AI_PENDING] = {"checkbox": True}
+
+        if main_notion_id:
+            res_op = self.notion.update_page(main_notion_id, main_props)
+        else:
+            res_op = self.notion.create_page(MAIN_DB_ID, main_props)
+            if res_op.status_code == 200:
+                main_notion_id = res_op.json()["id"]
+
+        if res_op.status_code != 200:
+            op_type = "update" if main_notion_id else "create"
+            self.logger.error(
+                f"[DIRECT] Notion {op_type} FAILED — candidate='{ai_data.get('name', '?')}', "
+                f"process='{current_process_name}', status={res_op.status_code}, body={res_op.text[:300]}"
+            )
+            return
+
+        # 6. Supabase sync
+        candidate_sql_data = DomainMapper.map_to_supabase_candidate(
+            ai_data,
+            public_url,
+            source=source_to_pass
+        )
+
+        json_payload = candidate_sql_data["candidate_data"]
+
+        if ai_failed or needs_ai_pending:
+            json_payload["ai_pending"] = True
+            json_payload["ai_pending_cv_url"] = public_url
+            json_payload["ai_pending_process_name"] = current_process_name
+
+        full_history = list(previous_history)
+        if current_process_name not in full_history:
+            full_history.append(current_process_name)
+        json_payload["recruiting_processes_history"] = full_history
+
+        full_roles = list(previous_team_role)
+        if current_process_type and current_process_type not in full_roles:
+            full_roles.append(current_process_type)
+        json_payload["proposed_teams_roles"] = full_roles
+
+        candidate_uuid = self.supa_manager.manage_candidate(candidate_sql_data, main_notion_id)
+
+        if candidate_uuid:
+            app_id = self.supa_manager.create_application(
+                candidate_uuid,
+                process_entry["notion_workflow_id"],
+                page_id,
+                effective_stage
+            )
+
+            # Discover and store Outcome Form DB ID
+            if app_id:
+                outcome_db_id = self.notion.find_child_database(page_id, "Process Outcome Form")
+                if outcome_db_id:
+                    self.supa_manager.update_application_outcome_id(app_id, outcome_db_id)
+
+        # 7. Strategic Assessment
+        if not ai_failed and not needs_ai_pending and ai_data.get("strategic_assessment"):
+            self._fill_strategic_assessment(page_id, ai_data["strategic_assessment"])
+
+        # 8. Close Workflow page
+        update_props = {
+            PROP_NAME: {"title": [{"text": {"content": ai_data["name"]}}]},
+        }
+        if public_url:
+            cv_display_name = f"CV - {ai_data.get('name', 'Unknown')}"
+            update_props[PROP_CV_FILES] = {"files": [{"name": cv_display_name, "external": {"url": public_url}}]}
+        if main_notion_id:
+            update_props[relation_col_name] = {"relation": [{"id": main_notion_id}]}
+        if initial_stage and not existing_stage:
+            update_props[PROP_STAGE] = {"select": {"name": initial_stage}}
+
+        res_close = self.notion.update_page(page_id, update_props)
+        if res_close.status_code != 200:
+            self.logger.error(
+                f"[DIRECT] Workflow close FAILED — candidate='{ai_data.get('name', '?')}', "
+                f"page={page_id[:8]}..., status={res_close.status_code}"
+            )
+        self.logger.info(f"[DIRECT] Candidate processed successfully: {ai_data['name']}")
+
+
     def run_once(self):
         """Executes a full pass through all active processes."""
         self.logger.info("Harvester starting")
@@ -971,6 +1311,9 @@ class HarvesterRelational:
                         break
                     self.process_candidate(cand, proc, rel_col, stage_init)
                     cvs_processed_today += 1
+
+        # --- STEP 2.5: DIRECT ENTRY PROCESSING ---
+        cvs_processed_today = self._process_direct_candidates(processes, cvs_processed_today)
 
         # --- STEP 3: REPROCESS AI PENDING ---
         self._reprocess_ai_pending()

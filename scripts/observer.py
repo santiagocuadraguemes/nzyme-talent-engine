@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.notion_client import NotionClient
+from core.notion_client import NotionClient, get_all_team_group_ids
 from core.supabase_client import SupabaseManager
 from core.storage_client import StorageClient
 from core.ai_parser import CVAnalyzer
@@ -21,7 +21,7 @@ from core.constants import (
     PROP_NAME, PROP_EMAIL, PROP_PHONE, PROP_LINKEDIN, PROP_CV_FILES,
     PROP_NEXT_STEPS, PROP_PROCESS_HISTORY, PROP_TEAM_ROLE,
     PROP_CHECKBOX_PROCESSED, PROP_HEADHUNTER_FEEDBACK, PROP_AI_PENDING,
-    PROP_ASSESSMENT_REQUESTED,
+    PROP_ASSESSMENT_REQUESTED, PROP_ASSESSMENT, PROP_CONFIDENTIAL_RELATION,
     PROP_EXP_TOTAL_YEARS, PROP_EXP_CONSULTING, PROP_EXP_AUDIT,
     PROP_EXP_IB, PROP_EXP_PE, PROP_EXP_VC, PROP_EXP_ENGINEER,
     PROP_EXP_LAWYER, PROP_EXP_FOUNDER, PROP_EXP_CORP_MA, PROP_EXP_PORTCO,
@@ -30,6 +30,7 @@ from core.constants import (
     PROP_EXP_TECHNOLOGY, PROP_EXP_INTERNATIONAL, PROP_EXP_INDUSTRIES,
     PROP_LANGUAGES, PROP_EDU_BACHELORS, PROP_EDU_MASTERS,
     PROP_EDU_UNIVERSITIES, PROP_EDU_MBAS,
+    PROP_GOVERNANCE_ACCESS,
 )
 
 
@@ -45,6 +46,7 @@ LOOKBACK_MINUTES = int(os.getenv("OBSERVER_LOOKBACK_MINUTES", "11"))
 MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
 PROCESS_DASHBOARD_DB_ID = os.getenv("NOTION_PROCESS_DASHBOARD_DB_ID")
 CENTRAL_REFS_DB_ID = os.getenv("NOTION_REFERENCES_DB_ID")
+CONFIDENTIAL_DB_ID = os.getenv("NOTION_CONFIDENTIAL_DB_ID")
 INTERNAL_REFS_DB_TITLE = "Candidate References [Input here feedback received]"
 TEMP_FOLDER = "/tmp/temp_downloads"
 
@@ -592,9 +594,56 @@ class Observer:
             # 5. Sync rejection reason to Supabase
             self.supa.update_rejection_reason(candidate_id, explanation_val, final_stage_name)
             self.logger.info("Outcome processed successfully")
+
+            # 6. Create Confidential Assessment for "Discarded completely for Nzyme"
+            if outcome_val == "Discarded completely for Nzyme":
+                self._create_confidential_assessment(candidate_id, explanation_val)
         else:
             self.logger.error(f"[OUTCOME] Failed to update candidate {candidate_id}: {res_upd.text}")
 
+
+
+    def _create_confidential_assessment(self, workflow_page_id, explanation):
+        """Creates a 'Discarded' entry in the Confidential Assessments DB linked to the candidate's Main DB page."""
+        try:
+            if not CONFIDENTIAL_DB_ID:
+                self.logger.warning("[OUTCOME] NOTION_CONFIDENTIAL_DB_ID not set, skipping Confidential Assessment")
+                return
+
+            # 1. Get process name, candidate name, and Main DB page ID
+            ctx = self.supa.get_outcome_context(workflow_page_id)
+            if not ctx or not ctx.get("main_db_page_id"):
+                self.logger.warning(f"[OUTCOME] Could not resolve outcome context for {workflow_page_id[:8]}..., skipping Confidential Assessment")
+                return
+
+            process_name = ctx.get("process_name", "Unknown Process")
+            candidate_name = ctx.get("candidate_name", "Unknown")
+            main_db_page_id = ctx["main_db_page_id"]
+
+            # 2. Create page in Confidential Assessments DB
+            title = f"Discarded - {process_name} - {candidate_name}"
+            payload = {
+                PROP_NAME: {"title": [{"text": {"content": title}}]},
+                PROP_ASSESSMENT: {"select": {"name": "4. Discarded"}},
+                PROP_CONFIDENTIAL_RELATION: {"relation": [{"id": main_db_page_id}]},
+            }
+
+            res = self.notion.create_page(CONFIDENTIAL_DB_ID, payload)
+            if res.status_code == 200:
+                new_page_id = res.json()["id"]
+                self.logger.info(f"[OUTCOME] Confidential Assessment created: '{title}'")
+
+                # 3. Append explanation as page body
+                if explanation and explanation != "No explanation provided":
+                    blocks = [{"object": "block", "type": "paragraph", "paragraph": {
+                        "rich_text": [{"type": "text", "text": {"content": explanation}}]
+                    }}]
+                    self.notion.append_block_children(new_page_id, blocks)
+            else:
+                self.logger.error(f"[OUTCOME] Failed to create Confidential Assessment: {res.status_code} — {res.text}")
+
+        except Exception as e:
+            self.logger.error(f"[OUTCOME] Error creating Confidential Assessment: {e}", exc_info=True)
 
 
     # =========================================================================
@@ -1338,7 +1387,7 @@ class Observer:
             self.logger.error(f"[DISPATCH] Exception: {e}", exc_info=True)
 
     def sync_process_status(self, page):
-        """Helper for dashboard status sync"""
+        """Helper for dashboard status sync. Triggers confidential process backfill on close."""
         props = page["properties"]
         try:
             name_prop = props.get("Name", {}).get("title", [])
@@ -1352,8 +1401,88 @@ class Observer:
                 elif status_prop.get("status"): new_status = status_prop["status"]["name"]
 
             if new_status:
+                # Backfill history + restore governance BEFORE marking as closed
+                if new_status == "Closed":
+                    process = self.supa.get_process_by_name(name)
+                    if process and process.get("is_confidential"):
+                        self._handle_confidential_process_close(process)
+
                 self.supa.update_process_status_by_name(name, new_status)
-        except Exception: pass
+        except Exception as e:
+            self.logger.error(f"sync_process_status error for '{name if 'name' in dir() else '?'}': {e}")
+
+    def _handle_confidential_process_close(self, process):
+        """Backfills process history and restores governance for all candidates in a closing confidential process."""
+        process_name = process["process_name"]
+        process_id = process["id"]
+        self.logger.info(f"Confidential process closing: '{process_name}'. Backfilling history and restoring governance.")
+
+        apps = self.supa.get_applications_for_process(process_id)
+        if not apps:
+            self.logger.info(f"No applications found for process '{process_name}'. Nothing to backfill.")
+            return
+
+        all_members_entries = [{"object": "group", "id": gid} for gid in get_all_team_group_ids()]
+
+        for app in apps:
+            candidate_id = app.get("candidate_id")
+            if not candidate_id:
+                continue
+
+            try:
+                # Get candidate's Main DB page
+                cand = self.supa.client.table("NzymeTalentNetwork") \
+                    .select("notion_page_id, candidate_data") \
+                    .eq("id", candidate_id).execute()
+                if not cand.data:
+                    continue
+
+                main_page_id = cand.data[0].get("notion_page_id")
+                if not main_page_id:
+                    continue
+
+                # 1. Add process name to Recruiting Processes History
+                cand_data = cand.data[0].get("candidate_data", {})
+                history = cand_data.get("recruiting_processes_history", [])
+                if process_name not in history:
+                    history.append(process_name)
+
+                update_props = {
+                    PROP_PROCESS_HISTORY: {
+                        "multi_select": [{"name": p, "color": "default"} for p in history[-100:]]
+                    }
+                }
+
+                # 2. Recalculate governance
+                # Note: this process is still "Open" in DB (status update happens after this method)
+                # so get_active_confidential_processes_for_candidate will include it
+                other_conf = self.supa.get_active_confidential_processes_for_candidate(candidate_id)
+
+                if len(other_conf) <= 1:
+                    # Only the closing process (or none) — restore to everyone (groups)
+                    governance_entries = all_members_entries
+                else:
+                    # Other confidential processes exist — union their governance (individual users)
+                    merged = set()
+                    for people_list in other_conf:
+                        merged.update(people_list)
+                    governance_entries = [{"object": "user", "id": uid} for uid in merged]
+
+                update_props[PROP_GOVERNANCE_ACCESS] = {"people": governance_entries}
+
+                # 3. Update Notion Main DB page
+                self.notion.update_page(main_page_id, update_props)
+
+                # 4. Update Supabase history
+                cand_data["recruiting_processes_history"] = history
+                self.supa.client.table("NzymeTalentNetwork") \
+                    .update({"candidate_data": cand_data}) \
+                    .eq("id", candidate_id).execute()
+
+                self.logger.info(f"Backfilled history + restored governance for candidate {candidate_id[:8]}...")
+            except Exception as e:
+                self.logger.error(f"Error backfilling candidate {candidate_id[:8]}...: {e}")
+                continue
 
     def _find_candidate_ancestor(self, starting_id, starting_type):
         """Helper to walk up the Notion hierarchy to find the candidate page (has 'Stage' property)."""
