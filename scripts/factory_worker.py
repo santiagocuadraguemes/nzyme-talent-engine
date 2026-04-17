@@ -145,8 +145,6 @@ class FactoryWorkerV2:
                 return
             process_type = raw_select["name"]
 
-            is_portco = "PortCo" in process_type
-
             # 1c. Read confidentiality settings
             vis_select = props.get(PROP_PROCESS_VISIBILITY, {}).get("select")
             is_confidential = bool(vis_select and vis_select.get("name") == "Confidential")
@@ -158,7 +156,7 @@ class FactoryWorkerV2:
                     self.logger.warning(f"Confidential process '{process_name}' has empty governance — skipping confidential flag")
                     is_confidential = False
 
-            self.logger.debug(f"configure_process: name='{process_name}', type='{process_type}', is_portco={is_portco}, confidential={is_confidential}")
+            self.logger.debug(f"configure_process: name='{process_name}', type='{process_type}', confidential={is_confidential}")
             self.logger.info(f"Configuring: {process_name} ({process_type}){' [CONFIDENTIAL]' if is_confidential else ''}")
         except Exception as e:
             self.logger.error(f"Error extracting data: {e}", exc_info=True)
@@ -283,7 +281,7 @@ class FactoryWorkerV2:
 
                     self.notion.append_block_children(jd_page_id, content_blocks[:100], after=anchor_id)
 
-            new_jd_title = f"Role & Candidate Description - {process_name}" if is_portco else f"Job Description - {process_name}"
+            new_jd_title = f"Role & Candidate Description - {process_name}"
             res_jd = self.notion.update_page(jd_page_id, properties={"title": [{"text": {"content": new_jd_title}}]})
             if res_jd.status_code != 200:
                 self.logger.error(f"JD page title FAILED — page={jd_page_id[:8]}..., status={res_jd.status_code}")
