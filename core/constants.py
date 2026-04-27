@@ -60,6 +60,7 @@ PROP_ID = "ID"
 PROP_CHECKBOX_PROCESSED = "Processed"
 PROP_STAGE = "Stage"
 PROP_HEADHUNTER = "Headhunter"  # Checkbox in Form DB
+PROP_HEADHUNTER_RELATION = "Headhunter"  # Relation on Process Launcher -> Headhunters DB
 PROP_HEADHUNTER_FEEDBACK = "Headhunter's Feedback"  # File in Workflow DB
 PROP_NEXT_STEPS = "Next Steps"
 PROP_AI_PENDING = "AI Pending"
@@ -96,3 +97,37 @@ HANDLER_OUTCOME_FORM = "outcome_form"
 
 # --- DIRECT ENTRY ---
 SOURCE_DIRECT_ENTRY_PREFIX = "Direct Entry"
+
+
+# --- SOURCE VALUES (multi-select tag on Main DB) ---
+# Code only writes to Source (never Creator), and only for:
+#   - Form submission without Headhunter checkbox  → SOURCE_APPLIED_LINKEDIN
+#   - Form submission with Headhunter checkbox     → "Headhunter - {firm}" (or SOURCE_HEADHUNTER_FALLBACK)
+SOURCE_HEADHUNTER_PREFIX = "Headhunter - "
+SOURCE_HEADHUNTER_FALLBACK = "Headhunter"  # when headhunter=true but process has no firm set
+SOURCE_APPLIED_LINKEDIN = "Applied via LinkedIn"
+
+
+# --- OUTCOME FORM (Discarded/Disqualified/Lost select on Outcome Form DB) ---
+PROP_OUTCOME_SELECT = "Discarded/Disqualified/Lost"   # select on Outcome Form
+PROP_OUTCOME_EXPLANATION = "Explanation"              # rich_text on Outcome Form
+
+OUTCOME_DISCARDED    = "Discarded completely for Nzyme"
+OUTCOME_DISQUALIFIED = "Disqualified only for this role"
+OUTCOME_LOST         = "Lost for this process"
+
+# Title prefix for the page created in the Confidential Assessments DB
+OUTCOME_TITLE_PREFIX = {
+    OUTCOME_DISCARDED:    "Discarded",
+    OUTCOME_DISQUALIFIED: "Disqualified",
+    OUTCOME_LOST:         "Lost",
+}
+
+# Assessment select option to write on the Confidential Assessments page.
+# None means leave the property unset (no matching option exists in Notion).
+ASSESSMENT_DISCARDED = "4. Discarded"
+OUTCOME_ASSESSMENT_VALUE = {
+    OUTCOME_DISCARDED:    ASSESSMENT_DISCARDED,
+    OUTCOME_DISQUALIFIED: None,
+    OUTCOME_LOST:         None,
+}

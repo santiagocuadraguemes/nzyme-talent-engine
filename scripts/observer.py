@@ -31,6 +31,8 @@ from core.constants import (
     PROP_LANGUAGES, PROP_EDU_BACHELORS, PROP_EDU_MASTERS,
     PROP_EDU_UNIVERSITIES, PROP_EDU_MBAS,
     PROP_GOVERNANCE_ACCESS,
+    PROP_OUTCOME_SELECT, PROP_OUTCOME_EXPLANATION,
+    OUTCOME_TITLE_PREFIX, OUTCOME_ASSESSMENT_VALUE,
 )
 
 
@@ -567,10 +569,10 @@ class Observer:
             return
 
         # 2. Extract outcome value
-        outcome_prop = props.get("Discarded/Disqualified/Lost", {}).get("select")
+        outcome_prop = props.get(PROP_OUTCOME_SELECT, {}).get("select")
         outcome_val = outcome_prop["name"] if outcome_prop else None
 
-        explanation_obj = props.get("Explanation", {}).get("rich_text", [])
+        explanation_obj = props.get(PROP_OUTCOME_EXPLANATION, {}).get("rich_text", [])
         explanation_val = explanation_obj[0]["plain_text"] if explanation_obj else "No explanation provided"
 
         self.logger.debug(f"[OUTCOME] outcome_val='{outcome_val}', candidate_id={candidate_id[:8]}...")
@@ -595,16 +597,17 @@ class Observer:
             self.supa.update_rejection_reason(candidate_id, explanation_val, final_stage_name)
             self.logger.info("Outcome processed successfully")
 
-            # 6. Create Confidential Assessment for "Discarded completely for Nzyme"
-            if outcome_val == "Discarded completely for Nzyme":
-                self._create_confidential_assessment(candidate_id, explanation_val)
+            # 6. Create Confidential Assessment for any of the three outcome destinies
+            if outcome_val in OUTCOME_TITLE_PREFIX:
+                self._create_confidential_assessment(candidate_id, explanation_val, outcome_val)
         else:
             self.logger.error(f"[OUTCOME] Failed to update candidate {candidate_id}: {res_upd.text}")
 
 
 
-    def _create_confidential_assessment(self, workflow_page_id, explanation):
-        """Creates a 'Discarded' entry in the Confidential Assessments DB linked to the candidate's Main DB page."""
+    def _create_confidential_assessment(self, workflow_page_id, explanation, outcome_val):
+        """Creates an entry in the Confidential Assessments DB linked to the candidate's Main DB page
+        for any of the three Outcome Form destinies (Discarded / Disqualified / Lost)."""
         try:
             if not CONFIDENTIAL_DB_ID:
                 self.logger.warning("[OUTCOME] NOTION_CONFIDENTIAL_DB_ID not set, skipping Confidential Assessment")
@@ -620,13 +623,17 @@ class Observer:
             candidate_name = ctx.get("candidate_name", "Unknown")
             main_db_page_id = ctx["main_db_page_id"]
 
+            title_prefix = OUTCOME_TITLE_PREFIX[outcome_val]
+            assessment_value = OUTCOME_ASSESSMENT_VALUE.get(outcome_val)
+
             # 2. Create page in Confidential Assessments DB
-            title = f"Discarded - {process_name} - {candidate_name}"
+            title = f"{title_prefix} - {process_name} - {candidate_name}"
             payload = {
                 PROP_NAME: {"title": [{"text": {"content": title}}]},
-                PROP_ASSESSMENT: {"select": {"name": "4. Discarded"}},
                 PROP_CONFIDENTIAL_RELATION: {"relation": [{"id": main_db_page_id}]},
             }
+            if assessment_value is not None:
+                payload[PROP_ASSESSMENT] = {"select": {"name": assessment_value}}
 
             res = self.notion.create_page(CONFIDENTIAL_DB_ID, payload)
             if res.status_code == 200:
