@@ -28,7 +28,9 @@ from core.constants import (
     PROP_EXP_SALES_REVENUE, PROP_EXP_TECHNOLOGY, PROP_EXP_INTERNATIONAL,
     PROP_EXP_INDUSTRIES, PROP_LANGUAGES, PROP_EDU_BACHELORS, PROP_EDU_MASTERS,
     PROP_EDU_UNIVERSITIES, PROP_EDU_MBAS,
+    PROP_SOURCE,
     SOURCE_DIRECT_ENTRY_PREFIX,
+    SOURCE_HEADHUNTER_PREFIX, SOURCE_HEADHUNTER_FALLBACK, SOURCE_APPLIED_LINKEDIN,
 )
 from core.logger import get_logger
 
@@ -152,6 +154,19 @@ class HarvesterRelational:
         if title_list:
             return title_list[0].get("plain_text", "")
         return ""
+
+    def _read_existing_source_tags(self, main_notion_id):
+        """Returns existing Source multi-select tags from a Main DB page, or []."""
+        if not main_notion_id:
+            return []
+        try:
+            page = self.notion.get_page(main_notion_id)
+            if not page:
+                return []
+            return NotionParser._extract_tags(page.get("properties", {}).get(PROP_SOURCE))
+        except Exception as e:
+            self.logger.warning(f"Could not read existing source for {main_notion_id[:8]}...: {e}")
+            return []
 
     def _create_minimal_candidate_data(self, form_data):
         """
@@ -451,11 +466,19 @@ class HarvesterRelational:
         previous_history = []
         previous_team_role = []
 
-        # Determine if we should set source
         is_new_candidate = (cand_db is None)
-        existing_source = cand_db.get("source") if cand_db else None
-        should_set_source = is_new_candidate or (not existing_source)
-        source_value = "Headhunter" if is_headhunter else "LinkedIn"
+
+        # Source rule — code never touches Creator:
+        #   Headhunter submission  → "Headhunter - {firm}" (fallback to "Headhunter" if firm unresolved)
+        #   Non-headhunter form    → "Applied via LinkedIn"
+        if is_headhunter:
+            firm = process_entry.get("headhunter_name")
+            source_value = f"{SOURCE_HEADHUNTER_PREFIX}{firm}" if firm else SOURCE_HEADHUNTER_FALLBACK
+        else:
+            source_value = SOURCE_APPLIED_LINKEDIN
+
+        # Read existing Source tags so we append (not overwrite) on merge
+        existing_source_tags = self._read_existing_source_tags(main_notion_id)
 
         if cand_db:
             self.logger.debug(f"Identity resolved: merge (existing notion_id={main_notion_id[:8] if main_notion_id else None}...)")
@@ -470,10 +493,9 @@ class HarvesterRelational:
             self.logger.debug("Identity resolved: new candidate")
             self.logger.info(f"New candidate (Source: {source_value})")
 
-
-        # Determine source to pass (new candidates OR existing with empty source)
-        source_to_pass = source_value if should_set_source else None
-        self.logger.info(f"Source tracking: is_new={is_new_candidate}, existing_source={existing_source}, should_set={should_set_source}, passing={source_to_pass}")
+        # Supabase source column: write only on first ingest (don't overwrite existing)
+        supa_source = source_value if is_new_candidate or not (cand_db and cand_db.get("source")) else None
+        self.logger.info(f"Source tracking: is_new={is_new_candidate}, notion_source='{source_value}', supa_source={supa_source}")
 
         # --- 3a. GOVERNANCE: Determine access control for Main DB page ---
         is_confidential = process_entry.get("is_confidential", False)
@@ -504,7 +526,8 @@ class HarvesterRelational:
             existing_history=previous_history,
             process_type=current_process_type,
             existing_team_role=previous_team_role,
-            source=source_to_pass,
+            source=source_value,
+            existing_source_tags=existing_source_tags,
             governance_entries=governance_entries,
             skip_process_history=is_confidential
         )
@@ -566,7 +589,7 @@ class HarvesterRelational:
             candidate_sql_data = DomainMapper.map_to_supabase_candidate(
                 ai_data,
                 public_url,
-                source=source_to_pass
+                source=supa_source
             )
 
             json_payload = candidate_sql_data["candidate_data"]
@@ -1048,8 +1071,9 @@ class HarvesterRelational:
             self.logger.warning(f"[DIRECT] Empty name on page {page_id[:8]}..., skipping")
             return
 
+        # Direct entry: a team member manually added this candidate.
+        # Per Source rule, code does not attribute Source for direct entries — users manage it manually.
         creator_name = cand.get("created_by", {}).get("name", "Unknown")
-        source_value = f"{SOURCE_DIRECT_ENTRY_PREFIX} - {creator_name}"
 
         # Preserve existing stage if already set (don't override manual stage placement)
         stage_prop = props.get(PROP_STAGE, {})
@@ -1101,19 +1125,13 @@ class HarvesterRelational:
         previous_history = []
         previous_team_role = []
 
-        is_new_candidate = (cand_db is None)
-        existing_source = cand_db.get("source") if cand_db else None
-        should_set_source = is_new_candidate or (not existing_source)
-
         if cand_db:
             self.logger.info(f"[DIRECT] Existing candidate (ID: {main_notion_id}). Merging data")
             cand_json = cand_db.get("candidate_data") or {}
             previous_history = cand_json.get("recruiting_processes_history", [])
             previous_team_role = cand_json.get("proposed_teams_roles", [])
         else:
-            self.logger.info(f"[DIRECT] New candidate (Source: {source_value})")
-
-        source_to_pass = source_value if should_set_source else None
+            self.logger.info(f"[DIRECT] New candidate (added by {creator_name})")
 
         # 3b. GOVERNANCE: Determine access control for Main DB page
         is_confidential = process_entry.get("is_confidential", False)
@@ -1137,7 +1155,7 @@ class HarvesterRelational:
             else:
                 governance_entries = [{"object": "group", "id": gid} for gid in get_all_team_group_ids()]
 
-        # 4. Build Main DB payload
+        # 4. Build Main DB payload (Source intentionally omitted for direct entries)
         main_props = NotionBuilder.build_candidate_payload(
             ai_data,
             public_url,
@@ -1145,7 +1163,6 @@ class HarvesterRelational:
             existing_history=previous_history,
             process_type=current_process_type,
             existing_team_role=previous_team_role,
-            source=source_to_pass,
             governance_entries=governance_entries,
             skip_process_history=is_confidential
         )
@@ -1195,11 +1212,10 @@ class HarvesterRelational:
             )
             return
 
-        # 6. Supabase sync
+        # 6. Supabase sync (Source left null for direct entries)
         candidate_sql_data = DomainMapper.map_to_supabase_candidate(
             ai_data,
-            public_url,
-            source=source_to_pass
+            public_url
         )
 
         json_payload = candidate_sql_data["candidate_data"]

@@ -21,7 +21,7 @@ class SupabaseManager:
 
 
     # --- PROCESS MANAGEMENT ---
-    def register_process(self, notion_wf_id, notion_form_id, bulk_id, feedback_id, name, process_type, matrix_characteristics=None, assessment_characteristics=None, is_confidential=False, governance_people=None):
+    def register_process(self, notion_wf_id, notion_form_id, bulk_id, feedback_id, name, process_type, matrix_characteristics=None, assessment_characteristics=None, is_confidential=False, governance_people=None, headhunter_name=None):
         data = {
             "notion_workflow_id": notion_wf_id,
             "notion_form_id": notion_form_id,
@@ -33,7 +33,8 @@ class SupabaseManager:
             "matrix_characteristics": matrix_characteristics,
             "assessment_characteristics": assessment_characteristics,
             "is_confidential": is_confidential,
-            "governance_people": governance_people
+            "governance_people": governance_people,
+            "headhunter_name": headhunter_name
         }
         try:
             self.client.table("NzymeRecruitingProcesses").insert(data).execute()

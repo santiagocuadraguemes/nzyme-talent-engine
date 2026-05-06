@@ -150,12 +150,25 @@ class NotionBuilder:
         logger.debug(f"_create_functional_tags → {len(tags)} tag(s) ({len(roles)} unique role(s) + years tag)")
         return tags
 
+    @staticmethod
+    def _merge_tag(existing_tags, new_tag):
+        """Append new_tag to existing_tags if not already present (case-insensitive), preserving order."""
+        out = list(existing_tags or [])
+        lowered = {t.lower() for t in out if t}
+        if new_tag and new_tag.lower() not in lowered:
+            out.append(new_tag)
+        return out
+
     # --- MAIN BUILD METHOD ---
 
     @staticmethod
-    def build_candidate_payload(candidate_data, public_cv_url, process_name, existing_history=None, process_type=None, existing_team_role=None, source=None, governance_entries=None, skip_process_history=False):
+    def build_candidate_payload(candidate_data, public_cv_url, process_name, existing_history=None, process_type=None, existing_team_role=None, source=None, existing_source_tags=None, governance_entries=None, skip_process_history=False):
         """
         Builds the request body for Creating/Updating a page in Notion.
+
+        Source is a multi-select on Main DB; pass `existing_source_tags` to append
+        (de-duplicated) rather than overwrite. When `source` is None, the field is left untouched.
+        Creator is intentionally never written by this code.
         """
         exp = candidate_data.get("experience", {})
         edu = candidate_data.get("education", {})
@@ -194,9 +207,10 @@ class NotionBuilder:
         if candidate_data.get("email"):
             props[PROP_EMAIL] = {"email": candidate_data.get("email")}
 
-        # Source (only set for new candidates)
+        # Source (multi-select, append — de-duplicated case-insensitive)
         if source:
-            props[PROP_SOURCE] = {"multi_select": [{"name": source, "color": "default"}]}
+            merged_source = NotionBuilder._merge_tag(existing_source_tags, source)
+            props[PROP_SOURCE] = {"multi_select": [{"name": s, "color": "default"} for s in merged_source]}
 
         # Governance (people property for page-level access control)
         # governance_entries: list of {"object": "user"/"group", "id": "..."} dicts

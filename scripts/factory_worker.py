@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
 from core.guidelines_parser import GuidelinesParser
-from core.constants import PROP_READY_TO_PROCESS, PROP_PROCESSED_DASHBOARD, PROP_NAME, PROP_PROCESS_TYPE, PROP_PROCESS_VISIBILITY, PROP_GOVERNANCE_ACCESS
+from core.constants import PROP_READY_TO_PROCESS, PROP_PROCESSED_DASHBOARD, PROP_NAME, PROP_PROCESS_TYPE, PROP_PROCESS_VISIBILITY, PROP_GOVERNANCE_ACCESS, PROP_HEADHUNTER_RELATION
 from core.logger import get_logger
 
 load_dotenv()
@@ -116,6 +116,31 @@ class FactoryWorkerV2:
 
         return None
 
+    def _resolve_headhunter_name(self, dashboard_props):
+        """
+        Reads the Headhunter relation on a Process Launcher page, fetches the linked
+        Headhunters DB page, and returns its title. Returns None if relation empty/unresolvable.
+        """
+        relation = dashboard_props.get(PROP_HEADHUNTER_RELATION, {}).get("relation") or []
+        if not relation:
+            return None
+        hh_page_id = relation[0].get("id")
+        if not hh_page_id:
+            return None
+        try:
+            hh_page = self.notion.get_page(hh_page_id)
+            if not hh_page:
+                return None
+            title_list = hh_page.get("properties", {}).get("Name", {}).get("title", []) or []
+            if not title_list:
+                return None
+            firm = title_list[0].get("plain_text", "").strip()
+            return firm or None
+        except Exception as e:
+            self.logger.warning(f"Could not resolve headhunter firm name ({hh_page_id[:8]}...): {e}")
+            return None
+
+
     def find_pending_requests(self):
         """Searches for pages created by the button (Ready=True, Processed=False)."""
         if not self.dashboard_ds_id:
@@ -156,8 +181,11 @@ class FactoryWorkerV2:
                     self.logger.warning(f"Confidential process '{process_name}' has empty governance — skipping confidential flag")
                     is_confidential = False
 
-            self.logger.debug(f"configure_process: name='{process_name}', type='{process_type}', confidential={is_confidential}")
-            self.logger.info(f"Configuring: {process_name} ({process_type}){' [CONFIDENTIAL]' if is_confidential else ''}")
+            # 1d. Read headhunter firm (optional relation to Headhunters DB)
+            headhunter_name = self._resolve_headhunter_name(props)
+
+            self.logger.debug(f"configure_process: name='{process_name}', type='{process_type}', confidential={is_confidential}, headhunter='{headhunter_name}'")
+            self.logger.info(f"Configuring: {process_name} ({process_type}){' [CONFIDENTIAL]' if is_confidential else ''}{f' [HH: {headhunter_name}]' if headhunter_name else ''}")
         except Exception as e:
             self.logger.error(f"Error extracting data: {e}", exc_info=True)
             return
@@ -317,7 +345,8 @@ class FactoryWorkerV2:
             matrix_characteristics=matrix_chars,
             assessment_characteristics=assessment_chars,
             is_confidential=is_confidential,
-            governance_people=governance_people
+            governance_people=governance_people,
+            headhunter_name=headhunter_name
         )
 
         # 10. CLOSE

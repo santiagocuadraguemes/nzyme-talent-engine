@@ -67,10 +67,7 @@ class GuidelinesParser:
 
 
     def find_job_description_document(self, process_type_string):
-        """Searches for the Role & Candidate Description document.
-        Tolerant OR-filter accepts both the new "Role & Candidate Description" label
-        and the legacy "Job Description" label during the Notion rename rollout.
-        """
+        """Searches for the Role & Candidate Description document."""
         self._init_datasource()
         if not self.guidelines_ds_id: return None
 
@@ -96,17 +93,13 @@ class GuidelinesParser:
                 {"property": "Role", "select": {"equals": role}}
             ]
 
-
         final_filter = {
             "and": [
-                {"or": [
-                    {"property": "Document Type", "select": {"equals": "Role & Candidate Description"}},
-                    {"property": "Document Type", "select": {"equals": "Job Description"}},
-                ]}
+                {"property": "Document Type", "select": {"equals": "Role & Candidate Description"}},
             ] + filters
         }
 
-        self.logger.debug(f"find_job_description_document: querying with filter Document Type=Role & Candidate Description|Job Description, prefix={prefix}, role={role}")
+        self.logger.debug(f"find_job_description_document: querying with filter Document Type=Role & Candidate Description, prefix={prefix}, role={role}")
         results = self.notion.query_data_source(self.guidelines_ds_id, final_filter)
         self.logger.debug(f"find_job_description_document: {len(results)} result(s) returned")
         return results[0] if results else None
