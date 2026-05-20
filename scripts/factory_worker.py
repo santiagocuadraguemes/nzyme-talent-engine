@@ -1,8 +1,8 @@
 # factory_worker.py
+import difflib
 import sys
 import os
 import time
-import httpx
 from dotenv import load_dotenv
 
 # Path adjustment for local/Lambda execution
@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
 from core.guidelines_parser import GuidelinesParser
-from core.constants import PROP_READY_TO_PROCESS, PROP_PROCESSED_DASHBOARD, PROP_NAME, PROP_PROCESS_TYPE, PROP_PROCESS_VISIBILITY, PROP_GOVERNANCE_ACCESS, PROP_HEADHUNTER_RELATION
+from core.constants import PROP_PROCESSED_DASHBOARD, PROP_NAME, PROP_PROCESS_TYPE, PROP_PROCESS_VISIBILITY, PROP_GOVERNANCE_ACCESS, PROP_HEADHUNTER_RELATION
 from core.logger import get_logger
 
 load_dotenv()
@@ -19,7 +19,7 @@ load_dotenv()
 # --- CONFIGURATION ---
 PROCESS_DASHBOARD_DB_ID = os.getenv("NOTION_PROCESS_DASHBOARD_DB_ID")
 MAIN_DB_ID = os.getenv("NOTION_MAIN_DB_ID")
-POLLING_INTERVAL = 10
+TEMPLATE_NAME_PREFIX = "PROCESS TEMPLATE -"
 
 class FactoryWorkerV2:
     def __init__(self, notion_client: NotionClient, supa_client: SupabaseManager, parser: GuidelinesParser):
@@ -32,6 +32,64 @@ class FactoryWorkerV2:
     def _init_datasources(self):
         if not self.dashboard_ds_id and PROCESS_DASHBOARD_DB_ID:
             self.dashboard_ds_id = self.notion.get_data_source_id(PROCESS_DASHBOARD_DB_ID) or PROCESS_DASHBOARD_DB_ID
+
+    @staticmethod
+    def _strip_template_prefix(template_name):
+        name = (template_name or "").strip()
+        if name.upper().startswith(TEMPLATE_NAME_PREFIX.upper()):
+            return name[len(TEMPLATE_NAME_PREFIX):].strip()
+        return name
+
+    def _resolve_template_id_for_process_type(self, process_type):
+        """Fuzzy-match the Process Dashboard templates against `process_type`.
+        Returns the top-scoring template id, or None if no templates exist."""
+        if not self.dashboard_ds_id:
+            return None
+
+        url = f"{self.notion.base_url}/data_sources/{self.dashboard_ds_id}/templates"
+        response = self.notion.client.get(url)
+        if response.status_code != 200:
+            self.logger.error(f"List templates failed (status={response.status_code}): {response.text[:200]}")
+            return None
+
+        templates = response.json().get("templates", [])
+        if not templates:
+            self.logger.error("No templates returned from Process Dashboard data source")
+            return None
+
+        target = (process_type or "").strip().lower()
+        ranked = []
+        for t in templates:
+            suffix = self._strip_template_prefix(t.get("name", ""))
+            score = difflib.SequenceMatcher(None, target, suffix.lower()).ratio()
+            ranked.append({"template": t, "suffix": suffix, "score": score})
+        ranked.sort(key=lambda r: r["score"], reverse=True)
+
+        top = ranked[0]
+        runner_up_score = ranked[1]["score"] if len(ranked) > 1 else 0.0
+        self.logger.info(
+            f"Template match for '{process_type}': '{top['template'].get('name')}' "
+            f"(score={top['score']:.3f}, runner-up={runner_up_score:.3f})"
+        )
+        return top["template"].get("id")
+
+    def _apply_template_to_page(self, page_id, template_id):
+        """PATCH the page with a template; returns True on 200."""
+        url = f"{self.notion.base_url}/pages/{page_id}"
+        payload = {
+            "template": {"type": "template_id", "template_id": template_id},
+            "erase_content": True,
+        }
+        response = self.notion.client.patch(url, json=payload)
+        if response.status_code != 200:
+            self.logger.error(f"Apply template failed (page={page_id[:8]}..., status={response.status_code}): {response.text[:200]}")
+            return False
+        return True
+
+    def _page_has_child_databases(self, page_id):
+        """Detect template-already-applied: any child_database block on the page."""
+        blocks = self.notion.get_page_blocks(page_id)
+        return any(b.get("type") == "child_database" for b in blocks)
 
     def _get_default_template_id(self, workflow_db_id):
         """Get the default template ID for a workflow database."""
@@ -142,14 +200,14 @@ class FactoryWorkerV2:
 
 
     def find_pending_requests(self):
-        """Searches for pages created by the button (Ready=True, Processed=False)."""
+        """Safety-net query: pages with a Process Type set and not yet Processed."""
         if not self.dashboard_ds_id:
             return []
 
         filter_params = {
             "and": [
-                {"property": PROP_READY_TO_PROCESS, "checkbox": {"equals": True}},
-                {"property": PROP_PROCESSED_DASHBOARD, "checkbox": {"equals": False}}
+                {"property": PROP_PROCESSED_DASHBOARD, "checkbox": {"equals": False}},
+                {"property": PROP_PROCESS_TYPE, "select": {"is_not_empty": True}}
             ]
         }
         return self.notion.query_data_source(self.dashboard_ds_id, filter_params)
@@ -357,6 +415,39 @@ class FactoryWorkerV2:
         else:
             self.logger.error("Error registering in Supabase")
 
+    def _process_dashboard_page(self, page):
+        """Shared core: applies the template (if needed) and runs configure_process.
+
+        Idempotent — if the page already has child_database blocks, skips the PATCH
+        and only re-runs configure_process. Safe for retries from both the webhook
+        and EventBridge safety-net paths.
+        """
+        page_id = page["id"]
+        props = page.get("properties", {})
+
+        if props.get(PROP_PROCESSED_DASHBOARD, {}).get("checkbox", False):
+            self.logger.info(f"Skipping page {page_id[:8]}...: already Processed")
+            return
+
+        process_type_sel = props.get(PROP_PROCESS_TYPE, {}).get("select")
+        if not process_type_sel or not process_type_sel.get("name"):
+            self.logger.info(f"Skipping page {page_id[:8]}...: Process Type empty")
+            return
+        process_type = process_type_sel["name"]
+
+        if self._page_has_child_databases(page_id):
+            self.logger.info(f"Page {page_id[:8]}... already has child DBs — skipping template PATCH")
+        else:
+            template_id = self._resolve_template_id_for_process_type(process_type)
+            if not template_id:
+                self.logger.error(f"No template resolved for Process Type '{process_type}' — aborting page {page_id[:8]}...")
+                return
+            if not self._apply_template_to_page(page_id, template_id):
+                return
+            self.logger.info(f"Template applied to page {page_id[:8]}... — proceeding to configure")
+
+        self.configure_process(page)
+
     def run_from_webhook(self, page_id):
         """Processes a single dashboard page triggered by webhook (no polling)."""
         self._init_datasources()
@@ -364,43 +455,23 @@ class FactoryWorkerV2:
         if not page:
             self.logger.error(f"Could not fetch page {page_id}")
             return
-
-        props = page.get("properties", {})
-        ready = props.get(PROP_READY_TO_PROCESS, {}).get("checkbox", False)
-        processed = props.get(PROP_PROCESSED_DASHBOARD, {}).get("checkbox", False)
-
-        self.logger.debug(f"run_from_webhook: page={page_id[:8]}..., ready={ready}, processed={processed}")
-        if not ready or processed:
-            self.logger.info(f"Skipping: ready={ready}, processed={processed}")
-            return
-
-        self.configure_process(page)
+        self._process_dashboard_page(page)
 
     def run_once(self):
-        self.logger.info("FactoryWorker starting")
+        """EventBridge safety net — single query, no polling. Catches missed webhooks."""
+        self.logger.info("FactoryWorker starting (safety-net pass)")
         self._init_datasources()
 
-        MAX_WAIT = 90
-        POLL_INTERVAL = 10
-
         requests = self.find_pending_requests()
-        self.logger.debug(f"run_once: initial poll found {len(requests)} request(s)")
-        elapsed = 0
-        while not requests and elapsed < MAX_WAIT:
-            self.logger.info(f"No requests found, retrying in {POLL_INTERVAL}s... ({elapsed}/{MAX_WAIT}s elapsed)")
-            time.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
-            requests = self.find_pending_requests()
-            self.logger.debug(f"run_once: retry poll at {elapsed}s found {len(requests)} request(s)")
+        self.logger.debug(f"run_once: found {len(requests)} pending request(s)")
 
         if not requests:
-            self.logger.info(f"No pending requests found after waiting {MAX_WAIT}s")
+            self.logger.info("No pending requests found")
             return
 
-        self.logger.debug(f"run_once: processing {len(requests)} request(s)")
         self.logger.info(f"Processing {len(requests)} requests")
         for req in requests:
-            self.configure_process(req)
+            self._process_dashboard_page(req)
 
         self.logger.info("Execution completed")
 

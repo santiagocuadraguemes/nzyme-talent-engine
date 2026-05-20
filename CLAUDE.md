@@ -28,11 +28,11 @@ The AWS CLI is authenticated globally (IAM user `nzyme-santiago-IAM`, account `4
 | Lambda Function URL (webhooks) | `https://vi6n7zvmytou7djtx7ixmobc4e0ittqz.lambda-url.eu-west-1.on.aws/` | `eu-west-1` |
 | S3 deploy bucket | `nzyme-talent-engine-deploy` | `eu-west-1` |
 | CloudWatch log group | `/aws/lambda/nzyme-talent-management` | `eu-west-1` |
-| EventBridge: Factory | `nzyme-factory-schedule` — `cron(6/10 * * * ? *)` | `eu-west-1` |
+| EventBridge: Factory | `nzyme-factory-schedule` — `cron(0 * * * ? *)` | `eu-west-1` |
 | EventBridge: Harvester | `nzyme-harvester-schedule` — `cron(0/10 * * * ? *)` | `eu-west-1` |
 | EventBridge: Observer | `nzyme-observer-schedule` — `cron(3/10 * * * ? *)` | `eu-west-1` |
 
-All three schedules fire every 10 minutes, offset by 3 minutes so workers don't stampede.
+Harvester and Observer fire every 10 minutes (offset by 3 so they don't stampede). Factory runs hourly as a safety net only — new processes flow in via webhook, so the schedule just catches missed webhooks.
 
 ### Deploy
 

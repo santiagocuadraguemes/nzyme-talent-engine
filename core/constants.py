@@ -60,7 +60,7 @@ PROP_ID = "ID"
 PROP_CHECKBOX_PROCESSED = "Processed"
 PROP_STAGE = "Stage"
 PROP_HEADHUNTER = "Headhunter"  # Checkbox in Form DB
-PROP_HEADHUNTER_RELATION = "Headhunter"  # Relation on Process Launcher -> Headhunters DB
+PROP_HEADHUNTER_RELATION = "Headhunter"  # Relation on Process Dashboard -> Headhunters DB
 PROP_HEADHUNTER_FEEDBACK = "Headhunter's Feedback"  # File in Workflow DB
 PROP_NEXT_STEPS = "Next Steps"
 PROP_AI_PENDING = "AI Pending"
@@ -68,7 +68,6 @@ PROP_ASSESSMENT_REQUESTED = "Assessment Requested"
 
 
 # --- PROCESS DASHBOARD (FACTORY WORKER) ---
-PROP_READY_TO_PROCESS = "Ready to be Processed [Do not touch]"
 PROP_PROCESSED_DASHBOARD = "Processed [Do not touch]"
 PROP_PROCESS_TYPE = "Process Type"
 PROP_PROCESS_VISIBILITY = "Process Visibility"                    # Select: "Standard" | "Confidential"
@@ -84,7 +83,6 @@ PROP_ASSESS_FEEDBACK_EVIDENCE = "Feedback Evidence"
 
 
 # --- WEBHOOK HANDLER NAMES ---
-HANDLER_PROCESS_LAUNCHER = "process_launcher"
 HANDLER_PROCESS_DASHBOARD = "process_dashboard"
 HANDLER_MAIN_CANDIDATE = "main_candidate"
 HANDLER_CENTRAL_REFERENCE = "central_reference"

@@ -15,7 +15,7 @@ from core.guidelines_parser import GuidelinesParser
 from core.logger import get_logger, set_request_id
 from core.webhook_router import WebhookRouter
 from core.constants import (
-    HANDLER_PROCESS_LAUNCHER, HANDLER_PROCESS_DASHBOARD,
+    HANDLER_PROCESS_DASHBOARD,
     HANDLER_MAIN_CANDIDATE, HANDLER_CENTRAL_REFERENCE,
     HANDLER_WORKFLOW_ITEM, HANDLER_FEEDBACK_FORM,
     HANDLER_FORM_SUBMISSION, HANDLER_BULK_SUBMISSION,
@@ -32,7 +32,6 @@ logger = get_logger("LambdaRouter")
 
 # Feature flag → env var mapping
 WEBHOOK_FLAGS = {
-    HANDLER_PROCESS_LAUNCHER: "WEBHOOK_PROCESS_DASHBOARD_ENABLED",
     HANDLER_PROCESS_DASHBOARD: "WEBHOOK_PROCESS_DASHBOARD_ENABLED",
     HANDLER_MAIN_CANDIDATE: "WEBHOOK_MAIN_CANDIDATE_ENABLED",
     HANDLER_CENTRAL_REFERENCE: "WEBHOOK_CENTRAL_REFERENCE_ENABLED",
@@ -85,17 +84,7 @@ def _handle_workspace_webhook(handler_name, page_id, process_context):
     logger.info(f"[WEBHOOK] Dispatching: {handler_name} (page={page_id[:8]}...)")
 
     try:
-        # --- FACTORY: Process Launcher (auxiliary DB signals new process to create) ---
-        if handler_name == HANDLER_PROCESS_LAUNCHER:
-            n_client = NotionClient()
-            s_client = SupabaseManager()
-            g_parser = GuidelinesParser(n_client)
-
-            worker = FactoryWorkerV2(n_client, s_client, g_parser)
-            worker.run_once()
-            return {"statusCode": 200, "body": "Process launcher webhook handled"}
-
-        # --- FACTORY: Process Dashboard (direct page change + status sync) ---
+        # --- FACTORY: Process Dashboard (page creation → template + configure_process) ---
         if handler_name == HANDLER_PROCESS_DASHBOARD:
             n_client = NotionClient()
             s_client = SupabaseManager()
