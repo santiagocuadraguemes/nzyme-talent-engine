@@ -11,7 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.notion_client import NotionClient
 from core.supabase_client import SupabaseManager
 from core.guidelines_parser import GuidelinesParser
-from core.constants import PROP_PROCESSED_DASHBOARD, PROP_NAME, PROP_PROCESS_TYPE, PROP_PROCESS_VISIBILITY, PROP_GOVERNANCE_ACCESS, PROP_HEADHUNTER_RELATION
+from core.constants import PROP_PROCESSED_DASHBOARD, PROP_NAME, PROP_PROCESS_TYPE, PROP_PROCESS_VISIBILITY, PROP_GOVERNANCE_ACCESS, PROP_HEADHUNTER_RELATION, PROP_OPEN_CLOSED, STATUS_OPEN
 from core.logger import get_logger
 
 load_dotenv()
@@ -74,7 +74,7 @@ class FactoryWorkerV2:
         return top["template"].get("id")
 
     def _apply_template_to_page(self, page_id, template_id):
-        """PATCH the page with a template; returns True on 200."""
+        """PATCH the page with a template; returns True on 200. Also sets Open/Closed=Open."""
         url = f"{self.notion.base_url}/pages/{page_id}"
         payload = {
             "template": {"type": "template_id", "template_id": template_id},
@@ -84,6 +84,10 @@ class FactoryWorkerV2:
         if response.status_code != 200:
             self.logger.error(f"Apply template failed (page={page_id[:8]}..., status={response.status_code}): {response.text[:200]}")
             return False
+
+        res_status = self.notion.update_page(page_id, properties={PROP_OPEN_CLOSED: {"select": {"name": STATUS_OPEN}}})
+        if res_status.status_code != 200:
+            self.logger.error(f"Set Open/Closed=Open FAILED (page={page_id[:8]}..., status={res_status.status_code})")
         return True
 
     def _page_has_child_databases(self, page_id):

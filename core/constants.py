@@ -72,6 +72,8 @@ PROP_PROCESSED_DASHBOARD = "Processed [Do not touch]"
 PROP_PROCESS_TYPE = "Process Type"
 PROP_PROCESS_VISIBILITY = "Process Visibility"                    # Select: "Standard" | "Confidential"
 PROP_GOVERNANCE_ACCESS = "Governance: Edit & View Access"         # People property (Dashboard + Main DB)
+PROP_OPEN_CLOSED = "Open/Closed"                                  # Select: "Open" | "Closed" | "Deleted"
+STATUS_OPEN = "Open"
 
 
 # --- FEEDBACK ASSESSMENT CHILD DB ---
