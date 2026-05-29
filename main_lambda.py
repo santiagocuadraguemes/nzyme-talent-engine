@@ -13,7 +13,7 @@ from core.storage_client import StorageClient
 from core.ai_parser import CVAnalyzer
 from core.guidelines_parser import GuidelinesParser
 from core.logger import get_logger, set_request_id
-from core.webhook_router import WebhookRouter
+from core.webhook_router import WebhookRouter, verify_path_token
 from core.constants import (
     HANDLER_PROCESS_DASHBOARD,
     HANDLER_MAIN_CANDIDATE, HANDLER_CENTRAL_REFERENCE,
@@ -200,6 +200,15 @@ def lambda_handler(event, context):
 
     # CASE B/C: HTTP (Webhook / Function URL)
     elif isinstance(event, dict) and ("headers" in event or "requestContext" in event or "rawPath" in event):
+        # --- AUTH GATE: shared-secret URL path token ---
+        # Notion automation webhooks are UNSIGNED (no HMAC header), so the only
+        # auth signal is the long random token embedded in the URL path. This
+        # gates EVERYTHING that arrives over the Function URL — including the
+        # challenge handshake — and fails closed if WEBHOOK_PATH_TOKEN is unset.
+        # EventBridge (CASE A) never reaches here, so it is unaffected.
+        if not verify_path_token(event):
+            return _finalize({"statusCode": 401, "body": "Unauthorized"})
+
         # Parse body for workspace webhook detection
         router = WebhookRouter()  # Static resolution only, no Supabase yet
         parsed = router.parse_event(event)
@@ -308,18 +317,71 @@ def lambda_handler(event, context):
 
 
 # --- BLOCK FOR LOCAL TESTING (Simulation) ---
+def _simulate_path_token_auth():
+    """
+    Offline simulation of the Function-URL path-token auth gate.
+    Covers: (a) correct token proceeds, (b) wrong token → 401,
+    (c) missing WEBHOOK_PATH_TOKEN → reject (fail closed),
+    (d) EventBridge {"task": ...} → unaffected (no path required).
+    Runs no workers — asserts on the auth decision only.
+    """
+    from core.constants import ENV_WEBHOOK_PATH_TOKEN
+    from core.webhook_router import verify_path_token
+
+    print("\n--- PATH-TOKEN AUTH SIMULATION ---\n")
+    SECRET = "test-secret-abc123"
+
+    def fn_url_event(path):
+        # Function URL event shape (rawPath carries the token)
+        return {
+            "rawPath": path,
+            "requestContext": {"http": {"path": path, "method": "POST"}},
+            "headers": {"content-type": "application/json"},
+            "body": "{}",
+        }
+
+    # (a) Correct token → auth passes (decision only; no routing/worker run)
+    os.environ[ENV_WEBHOOK_PATH_TOKEN] = SECRET
+    assert verify_path_token(fn_url_event(f"/{SECRET}")) is True
+    assert verify_path_token(fn_url_event(f"/{SECRET}/")) is True  # trailing slash tolerated
+    print("(a) correct token             -> PASS (auth ok)")
+
+    # (b) Wrong token -> 401 before any routing
+    resp = lambda_handler(fn_url_event("/wrong-token"), None)
+    assert resp["statusCode"] == 401, resp
+    print("(b) wrong token               -> 401")
+
+    # (c) Missing/empty secret -> fail closed (reject even a 'correct' guess)
+    os.environ.pop(ENV_WEBHOOK_PATH_TOKEN, None)
+    resp = lambda_handler(fn_url_event(f"/{SECRET}"), None)
+    assert resp["statusCode"] == 401, resp
+    print("(c) missing WEBHOOK_PATH_TOKEN -> 401 (fail closed)")
+
+    # (d) EventBridge schedule -> never enters the HTTP branch (no path needed)
+    os.environ[ENV_WEBHOOK_PATH_TOKEN] = SECRET
+    eb_event = {"task": "harvester"}
+    assert "rawPath" not in eb_event and "headers" not in eb_event
+    print("(d) EventBridge {'task':...}  -> unaffected (HTTP branch skipped)")
+
+    os.environ.pop(ENV_WEBHOOK_PATH_TOKEN, None)
+    print("\nAll auth-gate assertions passed.\n")
+
+
 if __name__ == "__main__":
     print("\n--- LOCAL LAMBDA SIMULATION ---\n")
 
     # Uncomment the line you want to test:
+
+    # 0. Simulate the Function-URL path-token auth gate (offline, no workers)
+    _simulate_path_token_auth()
 
     # 1. Simulate Webhook Event (Factory - Legacy)
     # fake_webhook_event = {"headers": {"Content-Type": "application/json"}, "body": "{}"}
     # lambda_handler(fake_webhook_event, None)
 
     # 2. Simulate Timer Event (Harvester)
-    fake_schedule_event = {"task": "harvester"}
-    lambda_handler(fake_schedule_event, None)
+    # fake_schedule_event = {"task": "harvester"}
+    # lambda_handler(fake_schedule_event, None)
 
     # 3. Simulate Timer Event (Observer)
     # fake_observer_event = {"task": "observer"}

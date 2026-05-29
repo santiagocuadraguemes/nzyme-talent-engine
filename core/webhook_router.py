@@ -1,15 +1,65 @@
 # core/webhook_router.py
 
 import os
+import hmac
 import json
 from core.logger import get_logger
 from core.constants import (
+    ENV_WEBHOOK_PATH_TOKEN,
     HANDLER_PROCESS_DASHBOARD,
     HANDLER_MAIN_CANDIDATE, HANDLER_CENTRAL_REFERENCE,
     HANDLER_WORKFLOW_ITEM, HANDLER_FEEDBACK_FORM,
     HANDLER_FORM_SUBMISSION, HANDLER_BULK_SUBMISSION,
     HANDLER_OUTCOME_FORM,
 )
+
+_token_logger = get_logger("WebhookAuth")
+
+
+def _extract_path_token(event):
+    """
+    Returns the secret token carried in the Function URL path, or None.
+
+    The webhook URL is `https://<host>/<TOKEN>`, so the token is the path
+    stripped of slashes. Tolerates Function-URL quirks: missing path, trailing
+    slashes, and the two places the path can appear in the event.
+    NEVER logs the raw path — it contains the secret.
+    """
+    raw_path = event.get("rawPath")
+    if not raw_path:
+        request_context = event.get("requestContext") or {}
+        http = request_context.get("http") or {}
+        raw_path = http.get("path")
+    if not raw_path:
+        return None
+    token = raw_path.strip("/")
+    return token or None
+
+
+def verify_path_token(event):
+    """
+    Authenticates a Function-URL request via the shared-secret path token.
+
+    Constant-time compare (hmac.compare_digest) against WEBHOOK_PATH_TOKEN.
+    FAILS CLOSED: if the env secret is unset/empty, every request is rejected
+    (a missing secret must never degrade into "accept everything").
+    Returns True only on an exact match. Never logs the token or the raw path.
+    """
+    expected = os.getenv(ENV_WEBHOOK_PATH_TOKEN, "")
+    if not expected:
+        _token_logger.error(
+            f"[WEBHOOK] {ENV_WEBHOOK_PATH_TOKEN} is unset/empty — rejecting all "
+            f"Function-URL requests (fail closed)"
+        )
+        return False
+    token = _extract_path_token(event)
+    if not token:
+        _token_logger.warning("[WEBHOOK] Rejected: no path token present (path redacted)")
+        return False
+    if hmac.compare_digest(token, expected):
+        return True
+    _token_logger.warning("[WEBHOOK] Rejected: path token mismatch (path redacted)")
+    return False
 
 
 class WebhookRouter:

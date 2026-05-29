@@ -90,6 +90,23 @@ aws lambda get-function-configuration --function-name nzyme-talent-management \
 
 To flip a feature flag (e.g. enable a webhook handler) without redeploying, use `update-function-configuration` with `--environment`. **Note:** this replaces the entire env var map, so always GET first, modify, then PUT the full set back.
 
+#### Webhook Function URL auth (`WEBHOOK_PATH_TOKEN`)
+
+The public Function URL is authenticated by a shared-secret token in the URL path — Notion automation webhooks are unsigned, so this is the only auth gate. Full design in `.claude/rules/webhooks.md` ("Security Model").
+
+- **Required.** If `WEBHOOK_PATH_TOKEN` is unset/empty the Lambda rejects **all** Function-URL requests with 401 (fail closed). EventBridge schedules are unaffected.
+- The live webhook URL is `https://vi6n7zvmytou7djtx7ixmobc4e0ittqz.lambda-url.eu-west-1.on.aws/<WEBHOOK_PATH_TOKEN>` — the token is the path segment, and every Notion automation's "Send webhook" action must use this full URL.
+- Generate a token: `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+- Set it without wiping other env vars (GET → merge → PUT):
+  ```bash
+  aws lambda get-function-configuration --function-name nzyme-talent-management \
+    --region eu-west-1 --query 'Environment.Variables' > vars.json
+  # add/update "WEBHOOK_PATH_TOKEN" in vars.json, then:
+  aws lambda update-function-configuration --function-name nzyme-talent-management \
+    --region eu-west-1 --environment "Variables=$(cat vars.json)"
+  ```
+- Rotation is manual: regenerate → update the env var → re-paste the new URL into every automation. Never log or paste the token into shared channels.
+
 ### Pause / Resume Scheduled Workers
 
 ```bash

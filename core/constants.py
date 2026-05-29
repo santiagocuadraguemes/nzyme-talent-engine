@@ -84,6 +84,13 @@ PROP_ASSESS_CV_EVIDENCE = "CV Evidence"
 PROP_ASSESS_FEEDBACK_EVIDENCE = "Feedback Evidence"
 
 
+# --- WEBHOOK SECURITY ---
+# Name of the env var holding the shared-secret token embedded in the Function
+# URL path. Notion automation webhooks are unsigned (no HMAC), so this URL token
+# is the auth gate. Read only from the environment — never hardcode the value.
+ENV_WEBHOOK_PATH_TOKEN = "WEBHOOK_PATH_TOKEN"
+
+
 # --- WEBHOOK HANDLER NAMES ---
 HANDLER_PROCESS_DASHBOARD = "process_dashboard"
 HANDLER_MAIN_CANDIDATE = "main_candidate"
