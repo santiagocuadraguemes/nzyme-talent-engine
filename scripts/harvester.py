@@ -20,7 +20,7 @@ from core.domain_mapper import DomainMapper
 from core.utils import download_file
 from core.constants import (
     PROP_CHECKBOX_PROCESSED, PROP_ID, PROP_NAME, PROP_CV_FILES, PROP_STAGE,
-    PROP_HEADHUNTER, PROP_AI_PENDING, PROP_EXP_TOTAL_YEARS,
+    PROP_HEADHUNTER, PROP_HEADHUNTER_CANDIDATE_RELATION, PROP_AI_PENDING, PROP_EXP_TOTAL_YEARS,
     PROP_EXP_CONSULTING, PROP_EXP_AUDIT, PROP_EXP_IB, PROP_EXP_PE,
     PROP_EXP_VC, PROP_EXP_ENGINEER, PROP_EXP_LAWYER, PROP_EXP_FOUNDER,
     PROP_EXP_CORP_MA, PROP_EXP_PORTCO, PROP_EXP_MANAGEMENT, PROP_EXP_FINANCE,
@@ -167,6 +167,84 @@ class HarvesterRelational:
         except Exception as e:
             self.logger.warning(f"Could not read existing source for {main_notion_id[:8]}...: {e}")
             return []
+
+    def _page_has_child_databases(self, page_id):
+        """Detect template-already-applied: any child_database block on the page."""
+        blocks = self.notion.get_page_blocks(page_id)
+        return any(b.get("type") == "child_database" for b in blocks)
+
+    def _get_default_template_id(self, workflow_db_id):
+        """Returns the Workflow DB's default template id (or the first template), else None."""
+        ds_id = self.notion.get_data_source_id(workflow_db_id)
+        if not ds_id:
+            return None
+
+        url = f"{self.notion.base_url}/data_sources/{ds_id}/templates"
+        response = self.notion.client.get(url)
+        if response.status_code != 200:
+            self.logger.warning(f"Templates endpoint returned {response.status_code}")
+            return None
+
+        templates = response.json().get("templates", [])
+        for t in templates:
+            if t.get("is_default"):
+                return t.get("id")
+        return templates[0].get("id") if templates else None
+
+    def _apply_workflow_template_if_blank(self, page_id, workflow_db_id):
+        """
+        Applies the Workflow DB's default template to a freshly created intake page,
+        but ONLY if the page has no child_database blocks yet. Idempotent: safe under
+        webhook retries + EventBridge re-runs — never erases an already-populated page
+        (which would wipe the AI-filled assessment matrix). Returns True if applied.
+
+        Note: erase_content clears page BODY content only; properties (CV, Name, the
+        Headhunter relation) are untouched, so the CV survives the PATCH.
+        """
+        if self._page_has_child_databases(page_id):
+            self.logger.debug(f"Page {page_id[:8]}... already has child DBs — skipping template")
+            return False
+
+        template_id = self._get_default_template_id(workflow_db_id)
+        if not template_id:
+            self.logger.warning(f"No default template for workflow {workflow_db_id[:8]}... — skipping template apply")
+            return False
+
+        url = f"{self.notion.base_url}/pages/{page_id}"
+        payload = {"template": {"type": "template_id", "template_id": template_id}, "erase_content": True}
+        response = self.notion.client.patch(url, json=payload)
+        if response.status_code != 200:
+            self.logger.error(f"Apply template failed (page={page_id[:8]}..., status={response.status_code}): {response.text[:200]}")
+            return False
+
+        self.logger.info(f"Applied workflow template to {page_id[:8]}...")
+        return True
+
+    def _resolve_headhunter_from_page(self, page_props):
+        """
+        Reads the per-candidate Headhunter relation on a Workflow page, fetches the
+        linked Headhunters DB page, and returns its firm title. Returns None if the
+        property is absent (not every process has it), the relation is empty, or it
+        can't be resolved. Never raises — headhunter attribution is best-effort.
+        """
+        try:
+            relation = page_props.get(PROP_HEADHUNTER_CANDIDATE_RELATION, {}).get("relation") or []
+            if not relation:
+                return None
+            hh_page_id = relation[0].get("id")
+            if not hh_page_id:
+                return None
+            hh_page = self.notion.get_page(hh_page_id)
+            if not hh_page:
+                return None
+            title_list = hh_page.get("properties", {}).get("Name", {}).get("title", []) or []
+            if not title_list:
+                return None
+            firm = title_list[0].get("plain_text", "").strip()
+            return firm or None
+        except Exception as e:
+            self.logger.warning(f"Could not resolve headhunter from page: {e}")
+            return None
 
     def _create_minimal_candidate_data(self, form_data):
         """
@@ -993,6 +1071,31 @@ class HarvesterRelational:
             self.process_candidate(cand, process_context, rel_col, stage_init)
 
 
+    def process_workflow_intake(self, page_id, process_context):
+        """
+        Webhook intake for a candidate created directly in the Workflow DB with the CV
+        attached (no AUX Form round-trip). The page is processed through the same
+        direct-entry path as Step 2.5 — which applies the Workflow template if the page
+        is blank, then runs full CV processing — so the webhook and the EventBridge
+        safety net converge on one code path.
+        """
+        page = self.notion.get_page(page_id)
+        if not page:
+            self.logger.error(f"[INTAKE] Could not fetch page {page_id}")
+            return
+
+        wf_db_id = process_context["notion_workflow_id"]
+        ds_wf = self.notion.get_data_source_id(wf_db_id)
+        if not ds_wf:
+            self.logger.error(f"[INTAKE] Could not resolve workflow data source for {wf_db_id}")
+            return
+
+        rel_col = self.find_relation_property(ds_wf)
+        stage_init = self.determine_initial_stage(ds_wf)
+        self.logger.info(f"[INTAKE] Processing new workflow page {page_id[:8]}...")
+        self._process_direct_candidate(page, process_context, rel_col, stage_init)
+
+
     # --- DIRECT ENTRY PROCESSING (Step 2.5) ---
 
     def _process_direct_candidates(self, processes, cvs_processed):
@@ -1071,8 +1174,15 @@ class HarvesterRelational:
             self.logger.warning(f"[DIRECT] Empty name on page {page_id[:8]}..., skipping")
             return
 
-        # Direct entry: a team member manually added this candidate.
-        # Per Source rule, code does not attribute Source for direct entries — users manage it manually.
+        # Apply the Workflow template if the page is blank (idempotent — skipped when
+        # child DBs already exist). Gives form-direct intake pages their child DBs
+        # ("Past Experience [AI-generated]", Outcome Form, Gathered Feedback) without
+        # the AUX-form round-trip. No-op for UI-created pages that already have them.
+        self._apply_workflow_template_if_blank(page_id, process_entry["notion_workflow_id"])
+
+        # Source attribution on this path is headhunter-only (resolved below from the
+        # per-candidate relation). Non-headhunter rows stay user-managed — code does not
+        # auto-tag them, so manual direct entries keep their Source untouched.
         creator_name = cand.get("created_by", {}).get("name", "Unknown")
 
         # Preserve existing stage if already set (don't override manual stage placement)
@@ -1133,6 +1243,18 @@ class HarvesterRelational:
         else:
             self.logger.info(f"[DIRECT] New candidate (added by {creator_name})")
 
+        # Headhunter attribution — per-candidate relation on the Workflow page (opt-in
+        # per process). Relation present → "Headhunter - {firm}"; absent → Source left
+        # untouched (non-headhunter direct entries stay user-managed, per Source contract).
+        firm = self._resolve_headhunter_from_page(props)
+        source_value = f"{SOURCE_HEADHUNTER_PREFIX}{firm}" if firm else None
+        if source_value:
+            self.logger.info(f"[DIRECT] Headhunter source: '{source_value}'")
+        # Append (not overwrite) on merge; only read existing tags when we have something to write
+        existing_source_tags = self._read_existing_source_tags(main_notion_id) if source_value else []
+        # Supabase source column: write only on first ingest (don't overwrite existing)
+        supa_source = source_value if (source_value and (cand_db is None or not cand_db.get("source"))) else None
+
         # 3b. GOVERNANCE: Determine access control for Main DB page
         is_confidential = process_entry.get("is_confidential", False)
         process_governance = process_entry.get("governance_people")
@@ -1155,7 +1277,7 @@ class HarvesterRelational:
             else:
                 governance_entries = [{"object": "group", "id": gid} for gid in get_all_team_group_ids()]
 
-        # 4. Build Main DB payload (Source intentionally omitted for direct entries)
+        # 4. Build Main DB payload (Source written only for headhunter-relation candidates)
         main_props = NotionBuilder.build_candidate_payload(
             ai_data,
             public_url,
@@ -1163,6 +1285,8 @@ class HarvesterRelational:
             existing_history=previous_history,
             process_type=current_process_type,
             existing_team_role=previous_team_role,
+            source=source_value,
+            existing_source_tags=existing_source_tags,
             governance_entries=governance_entries,
             skip_process_history=is_confidential
         )
@@ -1212,10 +1336,11 @@ class HarvesterRelational:
             )
             return
 
-        # 6. Supabase sync (Source left null for direct entries)
+        # 6. Supabase sync (Source written on first ingest only, headhunter candidates)
         candidate_sql_data = DomainMapper.map_to_supabase_candidate(
             ai_data,
-            public_url
+            public_url,
+            source=supa_source
         )
 
         json_payload = candidate_sql_data["candidate_data"]

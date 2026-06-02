@@ -61,6 +61,7 @@ PROP_CHECKBOX_PROCESSED = "Processed"
 PROP_STAGE = "Stage"
 PROP_HEADHUNTER = "Headhunter"  # Checkbox in Form DB
 PROP_HEADHUNTER_RELATION = "Headhunter"  # Relation on Process Dashboard -> Headhunters DB
+PROP_HEADHUNTER_CANDIDATE_RELATION = "Headhunter"  # Relation on Workflow DB (per-candidate, opt-in) -> Headhunters DB
 PROP_HEADHUNTER_FEEDBACK = "Headhunter's Feedback"  # File in Workflow DB
 PROP_NEXT_STEPS = "Next Steps"
 PROP_AI_PENDING = "AI Pending"

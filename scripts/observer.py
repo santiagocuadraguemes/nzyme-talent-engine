@@ -292,6 +292,19 @@ class Observer:
 
 
 
+    def _is_workflow_intake(self, page):
+        """
+        True if this Workflow page is a brand-new candidate ingestion rather than a
+        stage change / assessment request on an existing candidate. Criteria: not yet
+        Processed AND no application row exists for it in Supabase.
+        """
+        props = page.get("properties", {})
+        if props.get(PROP_CHECKBOX_PROCESSED, {}).get("checkbox", False):
+            return False
+        if self.supa.get_application_by_notion_id(page["id"]):
+            return False
+        return True
+
     def _handle_workflow_item(self, page, process_context):
         """Handler: Workflow (Detect stage change or assessment request)"""
         page_id = page["id"]
@@ -1595,6 +1608,20 @@ class Observer:
         page = self.notion.get_page(page_id)
         if not page:
             self.logger.error(f"[WEBHOOK] Could not fetch page {page_id}")
+            return
+
+        # New-candidate intake: a freshly created Workflow page (Processed=false, no
+        # application yet) is an ingestion, not a stage/assessment update. Hand it off
+        # to the Harvester (apply template + process CV). Gated by its own flag so it
+        # rolls back independently of stage-change handling. When disabled, falls
+        # through to the normal handler, which is a no-op for pages with no app record.
+        if (handler_name == HANDLER_WORKFLOW_ITEM
+                and os.getenv("WEBHOOK_WORKFLOW_INTAKE_ENABLED", "false").lower() == "true"
+                and self._is_workflow_intake(page)):
+            self.logger.info(f"[WEBHOOK] Workflow intake — new candidate page {page_id[:8]}...")
+            from scripts.harvester import HarvesterRelational
+            bot = HarvesterRelational(self.notion, self.supa, self.storage, self.ai, exa_client=self.exa)
+            bot.process_workflow_intake(page_id, process_context)
             return
 
         handler_map = {
