@@ -6,6 +6,7 @@ import json
 from core.logger import get_logger
 from core.constants import (
     ENV_WEBHOOK_PATH_TOKEN,
+    WEBHOOK_EVENT_HEADER,
     HANDLER_PROCESS_DASHBOARD,
     HANDLER_MAIN_CANDIDATE, HANDLER_CENTRAL_REFERENCE,
     HANDLER_WORKFLOW_ITEM, HANDLER_FEEDBACK_FORM,
@@ -34,6 +35,29 @@ def _extract_path_token(event):
         return None
     token = raw_path.strip("/")
     return token or None
+
+
+def extract_event_kind(event):
+    """
+    Returns the event kind declared by the Notion automation via the custom
+    request header (WEBHOOK_EVENT_HEADER, e.g. "X-Nzyme-Event: edit"), or None.
+
+    Notion automation payloads are byte-identical for page-created and
+    page-edited triggers, so the custom header is the only signal that
+    distinguishes them. Lambda Function URLs lowercase header names, but we
+    match case-insensitively anyway for robustness (local simulation, proxies).
+    Value is normalized to lowercase/stripped. Absent/malformed → None
+    (legacy behavior: callers fall back to page-state disambiguation).
+    """
+    headers = event.get("headers")
+    if not isinstance(headers, dict):
+        return None
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == WEBHOOK_EVENT_HEADER:
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+            return None
+    return None
 
 
 def verify_path_token(event):

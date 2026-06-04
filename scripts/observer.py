@@ -1593,18 +1593,26 @@ class Observer:
     # =========================================================================
     # 4. WEBHOOK ENTRY POINT
     # =========================================================================
-    def handle_webhook_event(self, handler_name, page_id, process_context=None):
+    def handle_webhook_event(self, handler_name, page_id, process_context=None, event_kind=None):
         """
         Entry point for webhook-triggered events.
         Fetches the full page and dispatches to the appropriate handler.
+
+        event_kind: value of the X-Nzyme-Event custom header set on the Notion
+        automation ("edit"/"created"/None). Edit-triggered automations declare
+        themselves so their webhooks never start an intake — without this, an
+        any-property-edited automation re-fires on the edits intake itself makes
+        (template apply, Name/CV writes) and double-parses the candidate with AI.
+        None (header not configured) → legacy page-state disambiguation.
         """
         from core.constants import (
             HANDLER_MAIN_CANDIDATE, HANDLER_PROCESS_DASHBOARD,
             HANDLER_CENTRAL_REFERENCE, HANDLER_WORKFLOW_ITEM,
             HANDLER_FEEDBACK_FORM, HANDLER_OUTCOME_FORM,
+            WEBHOOK_EVENT_EDIT,
         )
 
-        self.logger.debug(f"[WEBHOOK] Dispatching handler='{handler_name}', page={page_id[:8]}...")
+        self.logger.debug(f"[WEBHOOK] Dispatching handler='{handler_name}', page={page_id[:8]}..., event_kind={event_kind}")
         page = self.notion.get_page(page_id)
         if not page:
             self.logger.error(f"[WEBHOOK] Could not fetch page {page_id}")
@@ -1615,7 +1623,9 @@ class Observer:
         # to the Harvester (apply template + process CV). Gated by its own flag so it
         # rolls back independently of stage-change handling. When disabled, falls
         # through to the normal handler, which is a no-op for pages with no app record.
+        # Edit-declared automations (event_kind == "edit") never trigger intake.
         if (handler_name == HANDLER_WORKFLOW_ITEM
+                and event_kind != WEBHOOK_EVENT_EDIT
                 and os.getenv("WEBHOOK_WORKFLOW_INTAKE_ENABLED", "false").lower() == "true"
                 and self._is_workflow_intake(page)):
             self.logger.info(f"[WEBHOOK] Workflow intake — new candidate page {page_id[:8]}...")

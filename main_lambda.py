@@ -13,7 +13,7 @@ from core.storage_client import StorageClient
 from core.ai_parser import CVAnalyzer
 from core.guidelines_parser import GuidelinesParser
 from core.logger import get_logger, set_request_id
-from core.webhook_router import WebhookRouter, verify_path_token
+from core.webhook_router import WebhookRouter, verify_path_token, extract_event_kind
 from core.constants import (
     HANDLER_PROCESS_DASHBOARD,
     HANDLER_MAIN_CANDIDATE, HANDLER_CENTRAL_REFERENCE,
@@ -71,10 +71,15 @@ def _finalize(response):
     return response
 
 
-def _handle_workspace_webhook(handler_name, page_id, process_context):
-    """Dispatches workspace webhook event to the appropriate worker."""
+def _handle_workspace_webhook(handler_name, page_id, process_context, event_kind=None):
+    """Dispatches workspace webhook event to the appropriate worker.
 
-    logger.debug(f"_handle_workspace_webhook: handler={handler_name} page={page_id[:8]}... context_keys={list(process_context.keys()) if process_context else None}")
+    event_kind: value of the X-Nzyme-Event custom header ("edit"/"created"/None).
+    Currently only the workflow handler uses it (to suppress intake on edit
+    events); it is threaded through so any handler can use it later.
+    """
+
+    logger.debug(f"_handle_workspace_webhook: handler={handler_name} page={page_id[:8]}... event_kind={event_kind} context_keys={list(process_context.keys()) if process_context else None}")
 
     # Feature flag check
     if not _is_webhook_enabled(handler_name):
@@ -123,7 +128,7 @@ def _handle_workspace_webhook(handler_name, page_id, process_context):
             exa = _init_exa()
 
             obs = Observer(n_client, s_client, st_client, ai_agent, exa_client=exa)
-            obs.handle_webhook_event(handler_name, page_id, process_context)
+            obs.handle_webhook_event(handler_name, page_id, process_context, event_kind=event_kind)
             return {"statusCode": 200, "body": f"Observer webhook handled ({handler_name})"}
 
         # --- OBSERVER: Outcome Form (per-application DB, context is application row) ---
@@ -234,10 +239,13 @@ def lambda_handler(event, context):
             page_short = page_id[:8] if page_id else "N/A"
             logger.info(f"[TRIGGER] {source_type.capitalize()} webhook. DB: {db_short}... Page: {page_short}...")
 
+            # Event kind declared by the automation via custom header (edit/created/None)
+            event_kind = extract_event_kind(event)
+
             if source_type == "automation":
                 auto_id = source.get("automation_id", "N/A") or "N/A"
                 evt_id = source.get("event_id", "N/A") or "N/A"
-                logger.info(f"[TRIGGER] Automation details — automation_id: {auto_id}, event_id: {evt_id}")
+                logger.info(f"[TRIGGER] Automation details — automation_id: {auto_id}, event_id: {evt_id}, event_kind: {event_kind or 'unset'}")
 
             # Try static resolution first (no DB client needed)
             handler_name, process_ctx = router.resolve_handler(database_id)
@@ -252,7 +260,7 @@ def lambda_handler(event, context):
                 logger.debug(f"lambda_handler: dynamic resolution — handler={handler_name}")
 
             if handler_name:
-                return _finalize(_handle_workspace_webhook(handler_name, page_id, process_ctx))
+                return _finalize(_handle_workspace_webhook(handler_name, page_id, process_ctx, event_kind=event_kind))
             else:
                 logger.info(f"[WEBHOOK] Unrecognized database: {database_id}")
                 return _finalize({"statusCode": 200, "body": "Unrecognized database"})

@@ -124,6 +124,15 @@ BULK_IMPORT_TITLE_PREFIX = "Import: "  # title marker on Workflow pages created 
 DIRECT_INTAKE_GRACE_MINUTES = 15       # Step 2.5 only picks up direct-entry pages older than this (webhook wins the race)
 
 
+# --- WEBHOOK EVENT-KIND HEADER (custom header on Notion automation webhooks) ---
+# Notion automation payloads are identical for page-created and page-edited
+# triggers, so automations declare their kind via a custom request header.
+# Absent header → legacy behavior (intake disambiguation by page state).
+WEBHOOK_EVENT_HEADER = "x-nzyme-event"  # header name (Function URL lowercases keys)
+WEBHOOK_EVENT_EDIT = "edit"             # edit-triggered automation: never intake
+WEBHOOK_EVENT_CREATED = "created"       # creation-triggered automation (informational)
+
+
 # --- OUTCOME FORM (Discarded/Disqualified/Lost select on Outcome Form DB) ---
 PROP_OUTCOME_SELECT = "Discarded/Disqualified/Lost"   # select on Outcome Form
 PROP_OUTCOME_EXPLANATION = "Explanation"              # rich_text on Outcome Form
