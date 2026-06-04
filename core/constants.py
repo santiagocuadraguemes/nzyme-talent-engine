@@ -111,9 +111,17 @@ SOURCE_DIRECT_ENTRY_PREFIX = "Direct Entry"
 # Code only writes to Source (never Creator), and only for:
 #   - Form submission without Headhunter checkbox  → SOURCE_APPLIED_LINKEDIN
 #   - Form submission with Headhunter checkbox     → "Headhunter - {firm}" (or SOURCE_HEADHUNTER_FALLBACK)
+#   - Direct-entry page with Headhunter relation   → "Headhunter - {firm}"
+#   - Bulk-split page (BULK_IMPORT_TITLE_PREFIX)   → process headhunter_name → "Headhunter - {firm}" (or fallback)
 SOURCE_HEADHUNTER_PREFIX = "Headhunter - "
-SOURCE_HEADHUNTER_FALLBACK = "Headhunter"  # when headhunter=true but process has no firm set
+SOURCE_HEADHUNTER_FALLBACK = "Headhunter"  # when headhunter attribution applies but no firm is known
 SOURCE_APPLIED_LINKEDIN = "Applied via LinkedIn"
+
+
+# --- BULK IMPORT (splitter → Workflow DB direct path) ---
+PROP_BULK_CVS = "CVs"                  # files property on the Bulk DB batch rows
+BULK_IMPORT_TITLE_PREFIX = "Import: "  # title marker on Workflow pages created by the bulk splitter
+DIRECT_INTAKE_GRACE_MINUTES = 15       # Step 2.5 only picks up direct-entry pages older than this (webhook wins the race)
 
 
 # --- OUTCOME FORM (Discarded/Disqualified/Lost select on Outcome Form DB) ---

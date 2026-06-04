@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 
@@ -31,6 +32,7 @@ from core.constants import (
     PROP_SOURCE,
     SOURCE_DIRECT_ENTRY_PREFIX,
     SOURCE_HEADHUNTER_PREFIX, SOURCE_HEADHUNTER_FALLBACK, SOURCE_APPLIED_LINKEDIN,
+    PROP_BULK_CVS, BULK_IMPORT_TITLE_PREFIX, DIRECT_INTAKE_GRACE_MINUTES,
 )
 from core.logger import get_logger
 
@@ -246,6 +248,23 @@ class HarvesterRelational:
             self.logger.warning(f"Could not resolve headhunter from page: {e}")
             return None
 
+    @staticmethod
+    def _resolve_direct_source(firm, name, process_entry):
+        """
+        Source attribution for the direct-entry path. Precedence:
+        1. Per-candidate Headhunter relation firm (when resolved) → "Headhunter - {firm}"
+        2. Bulk-split page (BULK_IMPORT_TITLE_PREFIX title) → process headhunter_name
+           → "Headhunter - {firm}", or SOURCE_HEADHUNTER_FALLBACK when the process has
+           no firm set (all bulk candidates are assumed headhunter-sourced)
+        3. Otherwise None → Source left untouched (manual entries stay user-managed)
+        """
+        if firm:
+            return f"{SOURCE_HEADHUNTER_PREFIX}{firm}"
+        if (name or "").startswith(BULK_IMPORT_TITLE_PREFIX):
+            hh_name = (process_entry or {}).get("headhunter_name")
+            return f"{SOURCE_HEADHUNTER_PREFIX}{hh_name}" if hh_name else SOURCE_HEADHUNTER_FALLBACK
+        return None
+
     def _create_minimal_candidate_data(self, form_data):
         """
         Creates a CVData-compatible structure with empty defaults for candidates without CV.
@@ -357,14 +376,17 @@ class HarvesterRelational:
     # --- BATCH SPLITTER ---
     def process_bulk_imports(self, processes):
         """
-        Checks the 'Bulk Queue' queues.
-        Splits multi-file entries into individual Candidate Form entries.
+        Checks the 'Bulk Queue' queues. Split-only: each file becomes a page directly
+        in the Workflow DB (no AUX Form hop). Processing happens downstream via the
+        workflow-intake webhook (page.created) or Step 2.5 after its grace period.
+        The BULK_IMPORT_TITLE_PREFIX title marks these pages so source attribution
+        falls back to the process's headhunter.
         """
         for proc in processes:
             bulk_db_id = proc.get("notion_bulk_id")
-            form_db_id = proc.get("notion_form_id")
+            workflow_db_id = proc.get("notion_workflow_id")
 
-            if not bulk_db_id or not form_db_id: continue
+            if not bulk_db_id or not workflow_db_id: continue
 
 
             ds_bulk = self.notion.get_data_source_id(bulk_db_id)
@@ -382,7 +404,7 @@ class HarvesterRelational:
                 batch_id = batch["id"]
                 props = batch["properties"]
 
-                files = props.get("CVs", {}).get("files", [])
+                files = props.get(PROP_BULK_CVS, {}).get("files", [])
                 self.logger.debug(f"Bulk batch {batch_id[:8]}...: {len(files)} file(s)")
                 if not files:
                     res_empty = self.notion.update_page(batch_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
@@ -392,6 +414,7 @@ class HarvesterRelational:
 
 
                 errors_in_batch = False
+                created_count = 0
 
 
                 for file_obj in files:
@@ -415,8 +438,8 @@ class HarvesterRelational:
 
 
                     payload = {
-                        "Name": {"title": [{"text": {"content": f"Import: {file_name}"}}]},
-                        "CV": {
+                        PROP_NAME: {"title": [{"text": {"content": f"{BULK_IMPORT_TITLE_PREFIX}{file_name}"}}]},
+                        PROP_CV_FILES: {
                             "files": [
                                 {
                                     "type": "external",
@@ -424,20 +447,27 @@ class HarvesterRelational:
                                     "external": {"url": public_url}
                                 }
                             ]
-                        },
-                        PROP_HEADHUNTER: {"checkbox": True}
+                        }
                     }
 
-                    res = self.notion.create_page(form_db_id, payload)
+                    res = self.notion.create_page(workflow_db_id, payload)
 
                     if res.status_code != 200:
                         errors_in_batch = True
                         self.logger.error(f"Error creating '{file_name}'. Status: {res.status_code} | Body: {res.text[:500]}")
                     else:
-                        self.logger.debug(f"Bulk: split file '{file_name}' -> new Form entry created")
-                        # Delay so Notion automation fires separately for each entry
+                        created_count += 1
+                        self.logger.debug(f"Bulk: split file '{file_name}' -> new Workflow page created")
+                        # Delay so the page.created intake webhook fires separately per entry
                         time.sleep(10)
 
+
+                # Mark processed unless TOTAL failure (zero pages created): a total failure
+                # is safe to retry next run (no duplicate risk); a partial failure is not
+                # (re-splitting would duplicate the already-created Workflow pages).
+                if errors_in_batch and created_count == 0:
+                    self.logger.error(f"Bulk batch {batch_id[:8]}... total failure — leaving unprocessed for retry")
+                    continue
 
                 res_done = self.notion.update_page(batch_id, {PROP_CHECKBOX_PROCESSED: {"checkbox": True}})
                 if res_done.status_code != 200:
@@ -1098,10 +1128,34 @@ class HarvesterRelational:
 
     # --- DIRECT ENTRY PROCESSING (Step 2.5) ---
 
+    @staticmethod
+    def _build_direct_intake_filter(now=None):
+        """
+        Filter for Step 2.5's scheduled scan. Complementary to standard processing
+        (ID is_empty vs is_not_empty), plus a created_time grace period so the
+        workflow-intake webhook wins the race — without it, a scheduled run landing
+        right after the bulk splitter (or a form-direct submission) would double-parse
+        the same candidate with the AI. Uses Notion's BUILT-IN created_time timestamp
+        (never 400s on a DB missing a schema property; a rejected filter would make
+        query_data_source silently return [] and disable this safety net).
+        """
+        now = now or datetime.now(timezone.utc)
+        cutoff = (now - timedelta(minutes=DIRECT_INTAKE_GRACE_MINUTES)).isoformat()
+        return {
+            "and": [
+                {"property": PROP_CHECKBOX_PROCESSED, "checkbox": {"equals": False}},
+                {"property": PROP_ID, "rich_text": {"is_empty": True}},
+                {"property": PROP_NAME, "title": {"is_not_empty": True}},
+                {"timestamp": "created_time", "created_time": {"before": cutoff}}
+            ]
+        }
+
     def _process_direct_candidates(self, processes, cvs_processed):
         """
         Step 2.5: Process candidates added directly to Workflow DBs (no Form entry).
         These pages have Processed=false, empty ID field, and a non-empty Name.
+        Safety net only — pages younger than DIRECT_INTAKE_GRACE_MINUTES are left
+        to the workflow-intake webhook.
         """
         for proc in processes:
             if cvs_processed >= MAX_CVS_PER_RUN:
@@ -1112,15 +1166,7 @@ class HarvesterRelational:
             if not ds_wf:
                 continue
 
-            # Complementary filter to standard processing (ID is_empty vs is_not_empty)
-            filter_params = {
-                "and": [
-                    {"property": PROP_CHECKBOX_PROCESSED, "checkbox": {"equals": False}},
-                    {"property": PROP_ID, "rich_text": {"is_empty": True}},
-                    {"property": PROP_NAME, "title": {"is_not_empty": True}}
-                ]
-            }
-            candidates = self.notion.query_data_source(ds_wf, filter_params)
+            candidates = self.notion.query_data_source(ds_wf, self._build_direct_intake_filter())
 
             if not candidates:
                 continue
@@ -1243,11 +1289,11 @@ class HarvesterRelational:
         else:
             self.logger.info(f"[DIRECT] New candidate (added by {creator_name})")
 
-        # Headhunter attribution — per-candidate relation on the Workflow page (opt-in
-        # per process). Relation present → "Headhunter - {firm}"; absent → Source left
-        # untouched (non-headhunter direct entries stay user-managed, per Source contract).
+        # Headhunter attribution — per-candidate relation first; bulk-split pages
+        # (BULK_IMPORT_TITLE_PREFIX title) fall back to the process's headhunter;
+        # otherwise Source is left untouched (manual entries stay user-managed).
         firm = self._resolve_headhunter_from_page(props)
-        source_value = f"{SOURCE_HEADHUNTER_PREFIX}{firm}" if firm else None
+        source_value = self._resolve_direct_source(firm, name, process_entry)
         if source_value:
             self.logger.info(f"[DIRECT] Headhunter source: '{source_value}'")
         # Append (not overwrite) on merge; only read existing tags when we have something to write

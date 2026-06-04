@@ -95,6 +95,51 @@ class FactoryWorkerV2:
         blocks = self.notion.get_page_blocks(page_id)
         return any(b.get("type") == "child_database" for b in blocks)
 
+    @staticmethod
+    def _classify_child_blocks(blocks):
+        """Classifies a process page's child blocks by title keyword.
+
+        Order matters: "bulk"/"import" is checked BEFORE "form" so a bulk DB whose
+        title contains "form" (e.g. "Bulk Candidate Application Upload Form - X" on
+        an idempotent retry after renaming) is never misclassified as the Form DB.
+        The Form DB is optional — templates may omit it (form-direct intake).
+        """
+        result = {
+            "wf_db_id": None,
+            "form_db_id": None,
+            "bulk_db_id": None,
+            "feedback_db_id": None,
+            "jd_page_id": None,
+            "interview_stages_page_id": None,
+        }
+
+        for b in blocks:
+            if b["type"] == "child_database":
+                title = b.get("child_database", {}).get("title", "").lower()
+                bid = b["id"]
+
+                if "workflow" in title:
+                    result["wf_db_id"] = bid
+
+                elif "feedback" in title:
+                    result["feedback_db_id"] = bid
+
+                elif "bulk" in title or "import" in title:
+                    result["bulk_db_id"] = bid
+
+                elif "form" in title:
+                    result["form_db_id"] = bid
+
+            elif b["type"] == "child_page":
+                title = b.get("child_page", {}).get("title", "").lower()
+                bid = b["id"]
+                if "job" in title or "role" in title:
+                    result["jd_page_id"] = bid
+                elif "interview stages" in title:
+                    result["interview_stages_page_id"] = bid
+
+        return result
+
     def _get_default_template_id(self, workflow_db_id):
         """Get the default template ID for a workflow database."""
         ds_id = self.notion.get_data_source_id(workflow_db_id)
@@ -260,12 +305,7 @@ class FactoryWorkerV2:
             return
 
         # 2. Safety wait + 3. Identify child DBs (with retry for template propagation)
-        wf_db_id = None
-        form_db_id = None
-        bulk_db_id = None
-        feedback_db_id = None
-        jd_page_id = None
-        interview_stages_page_id = None
+        classified = {}
 
         for attempt in range(4):
             if attempt == 0:
@@ -275,39 +315,26 @@ class FactoryWorkerV2:
                 time.sleep(10)
 
             blocks = self.notion.get_page_blocks(page_id)
+            classified = self._classify_child_blocks(blocks)
 
-            for b in blocks:
-                if b["type"] == "child_database":
-                    title = b.get("child_database", {}).get("title", "").lower()
-                    bid = b["id"]
-
-                    if "workflow" in title:
-                        wf_db_id = bid
-
-                    elif "feedback" in title:
-                        feedback_db_id = bid
-
-                    elif "form" in title:
-                        form_db_id = bid
-
-                    elif "bulk" in title or "import" in title:
-                        bulk_db_id = bid
-
-                elif b["type"] == "child_page":
-                    title = b.get("child_page", {}).get("title", "").lower()
-                    bid = b["id"]
-                    if "job" in title or "role" in title:
-                        jd_page_id = bid
-                    elif "interview stages" in title:
-                        interview_stages_page_id = bid
-
-            if wf_db_id and form_db_id:
+            # Form DB is optional (form-direct intake templates omit it) — break as soon
+            # as the workflow plus either intake DB (form or bulk) has propagated.
+            if classified["wf_db_id"] and (classified["form_db_id"] or classified["bulk_db_id"]):
                 break
 
+        wf_db_id = classified.get("wf_db_id")
+        form_db_id = classified.get("form_db_id")
+        bulk_db_id = classified.get("bulk_db_id")
+        feedback_db_id = classified.get("feedback_db_id")
+        jd_page_id = classified.get("jd_page_id")
+        interview_stages_page_id = classified.get("interview_stages_page_id")
+
         self.logger.debug(f"configure_process: child DBs — wf={wf_db_id[:8] if wf_db_id else None}..., form={form_db_id[:8] if form_db_id else None}..., bulk={bulk_db_id[:8] if bulk_db_id else None}..., feedback={feedback_db_id[:8] if feedback_db_id else None}...")
-        if not wf_db_id or not form_db_id:
-            self.logger.critical("Main child DBs not found (Workflow/Form). Check the template.")
+        if not wf_db_id:
+            self.logger.critical("Workflow child DB not found. Check the template.")
             return
+        if not form_db_id:
+            self.logger.warning("No Form child DB in template — continuing (form-direct intake process)")
 
         # 4. Extract matrix characteristics from template
         matrix_chars = self._extract_matrix_from_template(wf_db_id)
@@ -343,10 +370,11 @@ class FactoryWorkerV2:
                 if res_stages.status_code != 200:
                     self.logger.error(f"Stage options update FAILED — ds={wf_ds_id[:8]}..., stages={len(stage_options)}, status={res_stages.status_code}")
 
-        # --- 7. CONFIGURE FORM DB ---
-        res_form_title = self.notion.update_database(form_db_id, title=f"Single Candidate Application Upload Form - {process_name}")
-        if res_form_title.status_code != 200:
-            self.logger.error(f"Form DB title rename FAILED — db={form_db_id[:8]}..., status={res_form_title.status_code}")
+        # --- 7. CONFIGURE FORM DB (optional — absent on form-direct intake templates) ---
+        if form_db_id:
+            res_form_title = self.notion.update_database(form_db_id, title=f"Single Candidate Application Upload Form - {process_name}")
+            if res_form_title.status_code != 200:
+                self.logger.error(f"Form DB title rename FAILED — db={form_db_id[:8]}..., status={res_form_title.status_code}")
 
         # --- CONFIGURE BULK QUEUE ---
         if bulk_db_id:
