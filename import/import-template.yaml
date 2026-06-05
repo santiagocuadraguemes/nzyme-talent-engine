@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# =======================================================================================
+# IMPORT-ONLY plain CloudFormation template for adopting the existing Nzyme Talent Engine
+# production resources into a NEW stack via
+#   aws cloudformation create-change-set --change-set-type IMPORT
+#
+# Why a separate plain-CFN template (no SAM transform)?
+#   * CloudFormation import rejects a template whose (post-transform) resource set contains
+#     any non-importable type. The SAM transform of AWS::Serverless::Function with
+#     FunctionUrlConfig/Events emits AWS::Lambda::Permission (NOT importable) and
+#     AWS::Lambda::Url (not safely importable). So the import uses ONLY the three importable,
+#     replacement-safe resource types below.
+#   * Logical IDs here are IDENTICAL to template.yaml (TalentEngineFunction,
+#     FactoryScheduleRule, HarvesterScheduleRule, ObserverScheduleRule, DeployBucket) so that,
+#     after import, management transitions to the SAM template.yaml via a normal `sam deploy`
+#     with all resources UPDATED IN PLACE (never replaced).
+#
+# Imported: the Lambda function, the 3 EventBridge schedule rules, the S3 deploy bucket.
+# NOT imported (stay out-of-band, protecting the live Function URL host): AWS::Lambda::Url,
+# AWS::Lambda::Permission. Every resource carries DeletionPolicy: Retain (required for import;
+# also protects production). Properties mirror infra-backup/live-config-2026-05-29.json.
+# Secrets are supplied as NoEcho parameters from the gitignored params/prod.json.
+# =======================================================================================
+Description: >
+  IMPORT-ONLY template: adopts the existing Nzyme Talent Engine Lambda function, the three
+  EventBridge schedule rules, and the S3 deploy bucket into a new CloudFormation stack.
+  Logical IDs match template.yaml so management transitions to the SAM template afterwards.
+
+Parameters:
+  FunctionNameParam:
+    Type: String
+    Default: nzyme-talent-management
+  ExecutionRoleArn:
+    Type: String
+    Default: arn:aws:iam::416418941636:role/service-role/nzyme-talent-management-role-jt70mt88
+  DeployBucketName:
+    Type: String
+    Default: nzyme-talent-engine-deploy
+  CodeS3Key:
+    Type: String
+    Default: lambda.zip
+  NotionMainDbId:
+    Type: String
+    Default: 2d683e67e2e780f89c0cf5b59d4d58db
+  NotionProcessDashboardDbId:
+    Type: String
+    Default: 2d983e67e2e780599500f103d7f72fbb
+  NotionGuidelinesDbId:
+    Type: String
+    Default: 2d683e67e2e7818fb9d1e95650edea95
+  NotionReferencesDbId:
+    Type: String
+    Default: 2e983e67e2e7803ea14cca7bdd499a9a
+  NotionConfidentialDbId:
+    Type: String
+    Default: 32f83e67e2e78028beb4db19621629f0
+  SupabaseUrl:
+    Type: String
+    Default: https://yphbrpbwpakjduhmoimw.supabase.co
+  NotionAllTeamGroupIds:
+    Type: String
+    Default: 0f0ef84a-2bdd-472c-b5a1-7d87ef3cd85f,2ee11893-ed9b-4f02-82c8-810edb1a4e33,5c74ae3c-0ccd-45a8-8e47-f8fb2dc91423,f59a6f3a-b692-4cc5-bbd8-291d4135d561
+  WebhookProcessDashboardEnabled:
+    Type: String
+    Default: "true"
+  WebhookMainCandidateEnabled:
+    Type: String
+    Default: "true"
+  WebhookWorkflowEnabled:
+    Type: String
+    Default: "true"
+  WebhookFeedbackEnabled:
+    Type: String
+    Default: "true"
+  WebhookFormSubmissionEnabled:
+    Type: String
+    Default: "true"
+  WebhookBulkSubmissionEnabled:
+    Type: String
+    Default: "true"
+  WebhookOutcomeEnabled:
+    Type: String
+    Default: "true"
+  WebhookPathToken:
+    Type: String
+    NoEcho: true
+  NotionKey:
+    Type: String
+    NoEcho: true
+  SupabaseKey:
+    Type: String
+    NoEcho: true
+  OpenAiApiKey:
+    Type: String
+    NoEcho: true
+  ExaApiKey:
+    Type: String
+    NoEcho: true
+  LogfireToken:
+    Type: String
+    NoEcho: true
+
+Resources:
+
+  TalentEngineFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref FunctionNameParam
+      Handler: main_lambda.lambda_handler
+      Runtime: python3.11
+      Role: !Ref ExecutionRoleArn
+      MemorySize: 512
+      Timeout: 300
+      Architectures:
+        - x86_64
+      EphemeralStorage:
+        Size: 512
+      Code:
+        S3Bucket: !Ref DeployBucketName
+        S3Key: !Ref CodeS3Key
+      Environment:
+        Variables:
+          NOTION_MAIN_DB_ID: !Ref NotionMainDbId
+          NOTION_PROCESS_DASHBOARD_DB_ID: !Ref NotionProcessDashboardDbId
+          NOTION_GUIDELINES_DB_ID: !Ref NotionGuidelinesDbId
+          NOTION_REFERENCES_DB_ID: !Ref NotionReferencesDbId
+          NOTION_CONFIDENTIAL_DB_ID: !Ref NotionConfidentialDbId
+          SUPABASE_URL: !Ref SupabaseUrl
+          NOTION_ALL_TEAM_GROUP_IDS: !Ref NotionAllTeamGroupIds
+          WEBHOOK_PROCESS_DASHBOARD_ENABLED: !Ref WebhookProcessDashboardEnabled
+          WEBHOOK_MAIN_CANDIDATE_ENABLED: !Ref WebhookMainCandidateEnabled
+          WEBHOOK_WORKFLOW_ENABLED: !Ref WebhookWorkflowEnabled
+          WEBHOOK_FEEDBACK_ENABLED: !Ref WebhookFeedbackEnabled
+          WEBHOOK_FORM_SUBMISSION_ENABLED: !Ref WebhookFormSubmissionEnabled
+          WEBHOOK_BULK_SUBMISSION_ENABLED: !Ref WebhookBulkSubmissionEnabled
+          WEBHOOK_OUTCOME_ENABLED: !Ref WebhookOutcomeEnabled
+          WEBHOOK_PATH_TOKEN: !Ref WebhookPathToken
+          NOTION_KEY: !Ref NotionKey
+          SUPABASE_KEY: !Ref SupabaseKey
+          OPENAI_API_KEY: !Ref OpenAiApiKey
+          EXA_API_KEY: !Ref ExaApiKey
+          LOGFIRE_TOKEN: !Ref LogfireToken
+
+  FactoryScheduleRule:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: nzyme-factory-schedule
+      Description: Factory safety net - hourly (webhook handles real-time process creation)
+      ScheduleExpression: cron(0 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: factory-target
+          Arn: !GetAtt TalentEngineFunction.Arn
+          Input: '{"task":"factory"}'
+
+  HarvesterScheduleRule:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: nzyme-harvester-schedule
+      Description: Harvester safety net - runs every 10 minutes
+      ScheduleExpression: cron(0/10 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: harvester-target
+          Arn: !GetAtt TalentEngineFunction.Arn
+          Input: '{"task":"harvester"}'
+
+  ObserverScheduleRule:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: nzyme-observer-schedule
+      Description: Observer safety net - runs every 10 minutes (offset +3)
+      ScheduleExpression: cron(3/10 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: observer-target
+          Arn: !GetAtt TalentEngineFunction.Arn
+          Input: '{"task":"observer"}'
+
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref DeployBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256

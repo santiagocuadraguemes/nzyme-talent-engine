@@ -1,0 +1,27 @@
+[
+  {
+    "ResourceType": "AWS::Lambda::Function",
+    "LogicalResourceId": "TalentEngineFunction",
+    "ResourceIdentifier": { "FunctionName": "nzyme-talent-management" }
+  },
+  {
+    "ResourceType": "AWS::Events::Rule",
+    "LogicalResourceId": "FactoryScheduleRule",
+    "ResourceIdentifier": { "Arn": "arn:aws:events:eu-west-1:416418941636:rule/nzyme-factory-schedule" }
+  },
+  {
+    "ResourceType": "AWS::Events::Rule",
+    "LogicalResourceId": "HarvesterScheduleRule",
+    "ResourceIdentifier": { "Arn": "arn:aws:events:eu-west-1:416418941636:rule/nzyme-harvester-schedule" }
+  },
+  {
+    "ResourceType": "AWS::Events::Rule",
+    "LogicalResourceId": "ObserverScheduleRule",
+    "ResourceIdentifier": { "Arn": "arn:aws:events:eu-west-1:416418941636:rule/nzyme-observer-schedule" }
+  },
+  {
+    "ResourceType": "AWS::S3::Bucket",
+    "LogicalResourceId": "DeployBucket",
+    "ResourceIdentifier": { "BucketName": "nzyme-talent-engine-deploy" }
+  }
+]

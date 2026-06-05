@@ -1,0 +1,11 @@
+[
+  { "_comment": "COPY this file to params/prod.json (gitignored) and fill in the real secret values. The real prod.json carries live secrets forward into `sam deploy` / the IMPORT change-set so they are never re-typed or committed. Non-secret parameters (DB IDs, flags, role ARN, bucket) use the defaults baked into template.yaml / import/import-template.yaml and only need to appear here if you want to override them. Format = `aws cloudformation --parameters file://` (also consumed by scripts/deploy-sam.ps1)." },
+  { "ParameterKey": "WebhookPathToken", "ParameterValue": "<the shared-secret URL path token>" },
+  { "ParameterKey": "NotionKey", "ParameterValue": "<NOTION_KEY>" },
+  { "ParameterKey": "SupabaseKey", "ParameterValue": "<SUPABASE_KEY service-role JWT>" },
+  { "ParameterKey": "OpenAiApiKey", "ParameterValue": "<OPENAI_API_KEY>" },
+  { "ParameterKey": "ExaApiKey", "ParameterValue": "<EXA_API_KEY>" },
+  { "ParameterKey": "LogfireToken", "ParameterValue": "<LOGFIRE_TOKEN>" },
+  { "ParameterKey": "ManageFunctionUrl", "ParameterValue": "false" },
+  { "ParameterKey": "ManageEventPermissions", "ParameterValue": "false" }
+]

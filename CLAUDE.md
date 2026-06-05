@@ -34,13 +34,29 @@ The AWS CLI is authenticated globally (IAM user `nzyme-santiago-IAM`, account `4
 
 Harvester and Observer fire every 10 minutes (offset by 3 so they don't stampede). Factory runs hourly as a safety net only — new processes flow in via webhook, so the schedule just catches missed webhooks.
 
+### Infrastructure as Code (AWS SAM)
+
+The infrastructure is now described in code: **`template.yaml`** (AWS SAM) is the version-controlled, reproducible definition of the whole stack — the Lambda function, the Function URL, the three EventBridge schedule rules + invoke permissions, and the S3 deploy bucket. `samconfig.toml` holds repeatable `sam deploy` settings (region `eu-west-1`, stack `nzyme-talent-engine`, capabilities, deploy bucket).
+
+Key design points (see `import/IMPORT_PLAN.md` for the full rationale):
+- **The live Function URL and all Lambda permissions are deliberately NOT managed by the stack.** `AWS::Lambda::Url` is not safely importable and `AWS::Lambda::Permission` is not importable at all; a delete+recreate of the URL would change its host and break every Notion webhook. Two `Condition` parameters — `ManageFunctionUrl` and `ManageEventPermissions`, both **default `false`** — keep them out of stack management for the adopted prod stack. They flip to `true` only for a greenfield reproduction in a fresh account.
+- Critical/stateful resources (the function, the bucket, the rules) carry `DeletionPolicy: Retain` + `UpdateReplacePolicy: Retain`, so no stack operation can destroy production.
+- **Secrets are never in git.** The secret env vars are `NoEcho` CloudFormation parameters, supplied at deploy time from the gitignored `params/prod.json` (template: `params/prod.example.json`). The 21 live env vars are reproduced exactly by the template.
+- The existing prod resources were brought under management via a one-time CloudFormation **resource import** (plain-CFN `import/import-template.yaml`, logical IDs matching `template.yaml`), not a recreate. Don't re-run the import; it's done once.
+
 ### Deploy
 
+Two supported paths — both build with manylinux2014_x86_64 / cp311 wheels (no Docker):
+
 ```powershell
+# IaC path (code + infrastructure) — preferred, post-import
+powershell -ExecutionPolicy Bypass -File scripts/deploy-sam.ps1
+
+# Legacy path (code only) — still works as a fallback
 powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1
 ```
 
-The script caches pip dependencies (reinstalls only when `requirements.txt` SHA changes), builds `lambda.zip`, uploads to `s3://nzyme-talent-engine-deploy/lambda.zip`, then runs `aws lambda update-function-code`. Direct upload is avoided because the zip is ~46 MB (hits Lambda's direct-upload timeout).
+`deploy-sam.ps1` builds `package/` exactly as before, then runs `sam deploy` against `template.yaml` (updating both code and infra) with secrets injected from `params/prod.json` and `ManageFunctionUrl=false` / `ManageEventPermissions=false` so the live URL is never touched. `deploy.ps1` caches pip dependencies (reinstalls only when `requirements.txt` SHA changes), builds `lambda.zip`, uploads to `s3://nzyme-talent-engine-deploy/lambda.zip`, then runs `aws lambda update-function-code`. Direct upload is avoided because the zip is ~46 MB (hits Lambda's direct-upload timeout).
 
 **Verify a deploy actually changed code** — `update-function-code` prints `LastModified`, but the authoritative check is `CodeSha256`:
 ```bash

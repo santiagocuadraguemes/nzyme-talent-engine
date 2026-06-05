@@ -1,0 +1,355 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Nzyme Talent Engine — serverless recruitment automation.
+  Single Lambda ("nzyme-talent-management") with three workers (Factory / Harvester /
+  Observer), dual-triggered by EventBridge schedules and a public Lambda Function URL
+  (Notion automation webhooks). This template is the Infrastructure-as-Code description of
+  the EXISTING production stack and is used to (a) adopt the live resources via
+  CloudFormation resource import and (b) reproduce the stack from scratch in a clean account.
+
+# ---------------------------------------------------------------------------------------
+# CRITICAL OPERATIONAL NOTES — read before any `sam deploy` against production
+# ---------------------------------------------------------------------------------------
+# 1. The live Lambda Function URL host (vi6n7zvmytou7djtx7ixmobc4e0ittqz...) is hardcoded
+#    into many Notion automation webhook actions. A delete+recreate of the URL changes the
+#    host and breaks every webhook. AWS::Lambda::Url is NOT safely importable and
+#    AWS::Lambda::Permission is NOT importable at all. Therefore, for the ADOPTED production
+#    stack we keep the Function URL + all Lambda permissions OUT of CloudFormation
+#    management: parameter ManageFunctionUrl=false and ManageEventPermissions=false (the
+#    defaults). The live URL + permissions remain exactly as created in the console and can
+#    never be touched by a stack operation.
+# 2. For a GREENFIELD reproduction in a fresh account (no pre-existing URL/permissions),
+#    deploy with ManageFunctionUrl=true and ManageEventPermissions=true so CloudFormation
+#    creates the URL and the invoke permissions. (The reproduced URL host will differ — that
+#    is inherent to Lambda Function URLs and unavoidable in any account but the original.)
+# 3. Logical IDs here match import/import-template.yaml so the import-adopted resources are
+#    updated in place (never replaced) when management transitions to this SAM template.
+# ---------------------------------------------------------------------------------------
+
+Parameters:
+
+  # ---- Non-secret configuration (safe to keep defaults in git) ----
+  FunctionNameParam:
+    Type: String
+    Default: nzyme-talent-management
+    Description: Lambda function name. MUST stay constant — changing it replaces the function.
+
+  ExecutionRoleArn:
+    Type: String
+    Default: arn:aws:iam::416418941636:role/service-role/nzyme-talent-management-role-jt70mt88
+    Description: >
+      ARN of the Lambda execution role. Defaults to the existing live service-role so the
+      adopted stack matches reality. Leave EMPTY to have this template create a managed role
+      (greenfield).
+
+  DeployBucketName:
+    Type: String
+    Default: nzyme-talent-engine-deploy
+    Description: S3 bucket holding the deployment artifact (lambda.zip).
+
+  # Notion / Supabase identifiers — not secret, but parameterised for portability.
+  NotionMainDbId:
+    Type: String
+    Default: 2d683e67e2e780f89c0cf5b59d4d58db
+  NotionProcessDashboardDbId:
+    Type: String
+    Default: 2d983e67e2e780599500f103d7f72fbb
+  NotionGuidelinesDbId:
+    Type: String
+    Default: 2d683e67e2e7818fb9d1e95650edea95
+  NotionReferencesDbId:
+    Type: String
+    Default: 2e983e67e2e7803ea14cca7bdd499a9a
+  NotionConfidentialDbId:
+    Type: String
+    Default: 32f83e67e2e78028beb4db19621629f0
+  SupabaseUrl:
+    Type: String
+    Default: https://yphbrpbwpakjduhmoimw.supabase.co
+  NotionAllTeamGroupIds:
+    Type: String
+    Default: 0f0ef84a-2bdd-472c-b5a1-7d87ef3cd85f,2ee11893-ed9b-4f02-82c8-810edb1a4e33,5c74ae3c-0ccd-45a8-8e47-f8fb2dc91423,f59a6f3a-b692-4cc5-bbd8-291d4135d561
+
+  # Webhook feature flags — current live values are all "true".
+  WebhookProcessDashboardEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  WebhookMainCandidateEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  WebhookWorkflowEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  WebhookWorkflowIntakeEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  WebhookFeedbackEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  WebhookFormSubmissionEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  WebhookBulkSubmissionEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  WebhookOutcomeEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  # ---- Secrets (NoEcho — values supplied from gitignored params/prod.json, never committed) ----
+  WebhookPathToken:
+    Type: String
+    NoEcho: true
+    Description: Shared-secret URL path token authenticating the public Function URL.
+  NotionKey:
+    Type: String
+    NoEcho: true
+  SupabaseKey:
+    Type: String
+    NoEcho: true
+  OpenAiApiKey:
+    Type: String
+    NoEcho: true
+  ExaApiKey:
+    Type: String
+    NoEcho: true
+  LogfireToken:
+    Type: String
+    NoEcho: true
+
+  # ---- Adoption / reproduction toggles ----
+  ManageFunctionUrl:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      false (default) = adopted prod: the Function URL is NOT managed here (protects the live
+      host). true = greenfield: create the Function URL + its public-access permission.
+  ManageEventPermissions:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      false (default) = adopted prod: invoke permissions stay out-of-band (already exist).
+      true = greenfield: create the EventBridge->Lambda invoke permissions.
+
+Conditions:
+  CreateExecutionRole: !Equals [!Ref ExecutionRoleArn, ""]
+  ShouldManageFunctionUrl: !Equals [!Ref ManageFunctionUrl, "true"]
+  ShouldManageEventPermissions: !Equals [!Ref ManageEventPermissions, "true"]
+
+Resources:
+
+  # =====================================================================================
+  # Lambda function — the single deployment unit running all three workers.
+  # DeletionPolicy/UpdateReplacePolicy Retain: a stack delete or accidental replace can
+  # never destroy the production function. Logical ID matches the import template.
+  # =====================================================================================
+  TalentEngineFunction:
+    Type: AWS::Serverless::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref FunctionNameParam
+      Description: ""
+      # Prebuilt deployment package. The build step (scripts/deploy-sam.ps1) installs
+      # manylinux2014_x86_64 / cp311 wheels into package/ WITHOUT Docker, then `sam deploy`
+      # uploads this directory. No `sam build` / --use-container is used.
+      CodeUri: package/
+      Handler: main_lambda.lambda_handler
+      Runtime: python3.11
+      Architectures:
+        - x86_64
+      MemorySize: 512
+      Timeout: 300
+      EphemeralStorage:
+        Size: 512
+      # Use the existing service-role by ARN for the adopted stack; create one for greenfield.
+      Role: !If [CreateExecutionRole, !GetAtt ManagedExecutionRole.Arn, !Ref ExecutionRoleArn]
+      Environment:
+        Variables:
+          # Notion / Supabase identifiers
+          NOTION_MAIN_DB_ID: !Ref NotionMainDbId
+          NOTION_PROCESS_DASHBOARD_DB_ID: !Ref NotionProcessDashboardDbId
+          NOTION_GUIDELINES_DB_ID: !Ref NotionGuidelinesDbId
+          NOTION_REFERENCES_DB_ID: !Ref NotionReferencesDbId
+          NOTION_CONFIDENTIAL_DB_ID: !Ref NotionConfidentialDbId
+          SUPABASE_URL: !Ref SupabaseUrl
+          NOTION_ALL_TEAM_GROUP_IDS: !Ref NotionAllTeamGroupIds
+          # Webhook feature flags
+          WEBHOOK_PROCESS_DASHBOARD_ENABLED: !Ref WebhookProcessDashboardEnabled
+          WEBHOOK_MAIN_CANDIDATE_ENABLED: !Ref WebhookMainCandidateEnabled
+          WEBHOOK_WORKFLOW_ENABLED: !Ref WebhookWorkflowEnabled
+          WEBHOOK_WORKFLOW_INTAKE_ENABLED: !Ref WebhookWorkflowIntakeEnabled
+          WEBHOOK_FEEDBACK_ENABLED: !Ref WebhookFeedbackEnabled
+          WEBHOOK_FORM_SUBMISSION_ENABLED: !Ref WebhookFormSubmissionEnabled
+          WEBHOOK_BULK_SUBMISSION_ENABLED: !Ref WebhookBulkSubmissionEnabled
+          WEBHOOK_OUTCOME_ENABLED: !Ref WebhookOutcomeEnabled
+          # Secrets (NoEcho parameters)
+          WEBHOOK_PATH_TOKEN: !Ref WebhookPathToken
+          NOTION_KEY: !Ref NotionKey
+          SUPABASE_KEY: !Ref SupabaseKey
+          OPENAI_API_KEY: !Ref OpenAiApiKey
+          EXA_API_KEY: !Ref ExaApiKey
+          LOGFIRE_TOKEN: !Ref LogfireToken
+
+  # =====================================================================================
+  # Execution role — only created for greenfield (ExecutionRoleArn left empty).
+  # Mirrors the live service-role: AWSLambdaBasicExecutionRole-equivalent (logs only).
+  # =====================================================================================
+  ManagedExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateExecutionRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: lambda-basic-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionNameParam}:*
+
+  # =====================================================================================
+  # Public Function URL (webhook entry point). Managed ONLY in greenfield mode — see notes.
+  # =====================================================================================
+  TalentEngineFunctionUrl:
+    Type: AWS::Lambda::Url
+    Condition: ShouldManageFunctionUrl
+    Properties:
+      TargetFunctionArn: !Ref TalentEngineFunction
+      AuthType: NONE
+      InvokeMode: BUFFERED
+
+  FunctionUrlPublicPermission:
+    Type: AWS::Lambda::Permission
+    Condition: ShouldManageFunctionUrl
+    Properties:
+      FunctionName: !Ref TalentEngineFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  # =====================================================================================
+  # EventBridge schedule rules — the safety-net triggers. EXACT cron expressions and the
+  # deliberate offsets are preserved. Logical IDs + Names match the import template.
+  # =====================================================================================
+  FactoryScheduleRule:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: nzyme-factory-schedule
+      Description: Factory safety net - hourly (webhook handles real-time process creation)
+      ScheduleExpression: cron(0 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: factory-target
+          Arn: !GetAtt TalentEngineFunction.Arn
+          Input: '{"task":"factory"}'
+
+  HarvesterScheduleRule:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: nzyme-harvester-schedule
+      Description: Harvester safety net - runs every 10 minutes
+      ScheduleExpression: cron(0/10 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: harvester-target
+          Arn: !GetAtt TalentEngineFunction.Arn
+          Input: '{"task":"harvester"}'
+
+  ObserverScheduleRule:
+    Type: AWS::Events::Rule
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: nzyme-observer-schedule
+      Description: Observer safety net - runs every 10 minutes (offset +3)
+      ScheduleExpression: cron(3/10 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: observer-target
+          Arn: !GetAtt TalentEngineFunction.Arn
+          Input: '{"task":"observer"}'
+
+  # EventBridge -> Lambda invoke permissions. Managed ONLY in greenfield mode (live ones
+  # already exist out-of-band; recreating them in the adopted stack would duplicate them).
+  FactoryInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ShouldManageEventPermissions
+    Properties:
+      FunctionName: !Ref TalentEngineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FactoryScheduleRule.Arn
+
+  HarvesterInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ShouldManageEventPermissions
+    Properties:
+      FunctionName: !Ref TalentEngineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HarvesterScheduleRule.Arn
+
+  ObserverInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ShouldManageEventPermissions
+    Properties:
+      FunctionName: !Ref TalentEngineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ObserverScheduleRule.Arn
+
+  # =====================================================================================
+  # S3 deploy bucket — holds lambda.zip. Retain so stack ops never delete deploy artifacts.
+  # =====================================================================================
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref DeployBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+Outputs:
+  FunctionArn:
+    Description: ARN of the Talent Engine Lambda function.
+    Value: !GetAtt TalentEngineFunction.Arn
+  FunctionUrl:
+    Description: Function URL (only when greenfield-managed; live prod URL is out-of-band).
+    Condition: ShouldManageFunctionUrl
+    Value: !GetAtt TalentEngineFunctionUrl.FunctionUrl
+  DeployBucket:
+    Description: S3 bucket used for deployment artifacts.
+    Value: !Ref DeployBucket

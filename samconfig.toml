@@ -1,0 +1,29 @@
+# AWS SAM CLI configuration for the Nzyme Talent Engine stack.
+# Committed to git — contains NO secrets. Secret parameters are supplied separately at
+# deploy time from the gitignored params/prod.json (see scripts/deploy-sam.ps1).
+version = 0.1
+
+[default.global.parameters]
+stack_name = "nzyme-talent-engine"
+
+[default.deploy.parameters]
+stack_name = "nzyme-talent-engine"
+region = "eu-west-1"
+# Reuse the existing deploy bucket for SAM artifacts (no Docker, no SAM-managed bucket needed).
+s3_bucket = "nzyme-talent-engine-deploy"
+s3_prefix = "sam"
+resolve_s3 = false
+# AUTO_EXPAND: process the AWS::Serverless transform. IAM: allow the (greenfield-only) role.
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+# Gate for HUMANS running raw `sam deploy` by hand: show the change set and confirm before
+# applying to production. The unattended script (scripts/deploy-sam.ps1) passes
+# --no-confirm-changeset to override this, so automated deploys never hang on the prompt.
+confirm_changeset = true
+disable_rollback = false
+# SAFETY DEFAULTS for the adopted production stack: never let CloudFormation manage the live
+# Function URL or recreate Lambda permissions (protects the hardcoded webhook URL host).
+# scripts/deploy-sam.ps1 also injects the NoEcho secret parameters from params/prod.json.
+parameter_overrides = "ManageFunctionUrl=false ManageEventPermissions=false"
+
+[default.validate.parameters]
+lint = true

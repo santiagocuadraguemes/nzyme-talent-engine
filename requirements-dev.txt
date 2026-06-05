@@ -1,0 +1,3 @@
+# Dependencias solo de desarrollo / pruebas (no viajan a Lambda).
+# Instalar en un entorno local: pip install -r requirements.txt -r requirements-dev.txt
+pytest

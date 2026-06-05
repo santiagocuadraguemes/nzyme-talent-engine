@@ -25,3 +25,18 @@ logs/
 # Lambda build artifacts
 package/
 lambda.zip
+
+# AWS SAM / CloudFormation IaC
+# Build output and packaged (S3-rewritten) templates
+.aws-sam/
+packaged.yaml
+# CloudFormation parameter overrides — real files CONTAIN SECRETS, never commit.
+# Ignore everything under params/ except the secret-free example.
+params/*
+!params/*.example.json
+# Full live-config backups — env-var dumps CONTAIN SECRETS, never commit
+infra-backup/
+
+# Local scratch artifacts
+nzyme-talent-management.zip
+cwli_results.json
