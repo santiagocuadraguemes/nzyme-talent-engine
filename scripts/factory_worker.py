@@ -99,16 +99,25 @@ class FactoryWorkerV2:
     def _classify_child_blocks(blocks):
         """Classifies a process page's child blocks by title keyword.
 
-        Order matters: "bulk"/"import" is checked BEFORE "form" so a bulk DB whose
-        title contains "form" (e.g. "Bulk Candidate Application Upload Form - X" on
-        an idempotent retry after renaming) is never misclassified as the Form DB.
-        The Form DB is optional — templates may omit it (form-direct intake).
+        The aux Form child DB is no longer part of templates — the candidate form
+        now lives embedded inside a regular child page ("form" in title →
+        form_page_id), renamed per-process like the JD page. A leftover Form
+        child DB on an un-migrated template is surfaced as legacy_form_db_id so
+        the caller can warn and skip it (never renamed, never registered).
+
+        Order matters. child_database arm: "feedback" before "bulk" (the feedback
+        DB title contains "bulk"), "bulk"/"import" before the legacy "form" check
+        (the renamed bulk title contains "form"). child_page arm: "form" is
+        checked LAST — specific keywords first — so a renamed JD page for a
+        process whose name happens to contain "form" (e.g. "...Transformation
+        Lead") never steals the form page slot on an idempotent retry.
         """
         result = {
             "wf_db_id": None,
-            "form_db_id": None,
             "bulk_db_id": None,
             "feedback_db_id": None,
+            "legacy_form_db_id": None,
+            "form_page_id": None,
             "jd_page_id": None,
             "interview_stages_page_id": None,
         }
@@ -128,7 +137,7 @@ class FactoryWorkerV2:
                     result["bulk_db_id"] = bid
 
                 elif "form" in title:
-                    result["form_db_id"] = bid
+                    result["legacy_form_db_id"] = bid
 
             elif b["type"] == "child_page":
                 title = b.get("child_page", {}).get("title", "").lower()
@@ -137,6 +146,8 @@ class FactoryWorkerV2:
                     result["jd_page_id"] = bid
                 elif "interview stages" in title:
                     result["interview_stages_page_id"] = bid
+                elif "form" in title:
+                    result["form_page_id"] = bid
 
         return result
 
@@ -317,24 +328,26 @@ class FactoryWorkerV2:
             blocks = self.notion.get_page_blocks(page_id)
             classified = self._classify_child_blocks(blocks)
 
-            # Form DB is optional (form-direct intake templates omit it) — break as soon
-            # as the workflow plus either intake DB (form or bulk) has propagated.
-            if classified["wf_db_id"] and (classified["form_db_id"] or classified["bulk_db_id"]):
+            # The form page is optional — break as soon as the workflow plus
+            # either the bulk DB or the form page has propagated.
+            if classified["wf_db_id"] and (classified["bulk_db_id"] or classified["form_page_id"]):
                 break
 
         wf_db_id = classified.get("wf_db_id")
-        form_db_id = classified.get("form_db_id")
+        form_page_id = classified.get("form_page_id")
         bulk_db_id = classified.get("bulk_db_id")
         feedback_db_id = classified.get("feedback_db_id")
         jd_page_id = classified.get("jd_page_id")
         interview_stages_page_id = classified.get("interview_stages_page_id")
 
-        self.logger.debug(f"configure_process: child DBs — wf={wf_db_id[:8] if wf_db_id else None}..., form={form_db_id[:8] if form_db_id else None}..., bulk={bulk_db_id[:8] if bulk_db_id else None}..., feedback={feedback_db_id[:8] if feedback_db_id else None}...")
+        self.logger.debug(f"configure_process: child blocks — wf={wf_db_id[:8] if wf_db_id else None}..., form_page={form_page_id[:8] if form_page_id else None}..., bulk={bulk_db_id[:8] if bulk_db_id else None}..., feedback={feedback_db_id[:8] if feedback_db_id else None}...")
         if not wf_db_id:
             self.logger.critical("Workflow child DB not found. Check the template.")
             return
-        if not form_db_id:
-            self.logger.warning("No Form child DB in template — continuing (form-direct intake process)")
+        if classified.get("legacy_form_db_id"):
+            self.logger.warning("Legacy Form child DB found in template — ignored (aux-form intake removed). Delete it from the process template.")
+        if not form_page_id:
+            self.logger.warning("No Form page in template — skipping form page rename. Add a child page embedding the Workflow form to the template.")
 
         # 4. Extract matrix characteristics from template
         matrix_chars = self._extract_matrix_from_template(wf_db_id)
@@ -370,11 +383,12 @@ class FactoryWorkerV2:
                 if res_stages.status_code != 200:
                     self.logger.error(f"Stage options update FAILED — ds={wf_ds_id[:8]}..., stages={len(stage_options)}, status={res_stages.status_code}")
 
-        # --- 7. CONFIGURE FORM DB (optional — absent on form-direct intake templates) ---
-        if form_db_id:
-            res_form_title = self.notion.update_database(form_db_id, title=f"Single Candidate Application Upload Form - {process_name}")
+        # --- 7. RENAME FORM PAGE (optional — child page embedding the Workflow form) ---
+        if form_page_id:
+            new_form_title = f"Single Candidate Application Upload Form - {process_name}"
+            res_form_title = self.notion.update_page(form_page_id, properties={"title": [{"text": {"content": new_form_title}}]})
             if res_form_title.status_code != 200:
-                self.logger.error(f"Form DB title rename FAILED — db={form_db_id[:8]}..., status={res_form_title.status_code}")
+                self.logger.error(f"Form page title rename FAILED — page={form_page_id[:8]}..., status={res_form_title.status_code}")
 
         # --- CONFIGURE BULK QUEUE ---
         if bulk_db_id:
@@ -427,7 +441,7 @@ class FactoryWorkerV2:
         self.logger.debug(f"configure_process: registering in Supabase — process='{process_name}'")
         supa_success = self.supa.register_process(
             wf_db_id,
-            form_db_id,
+            None,  # notion_form_id — aux Form DB removed; form-direct intake via the Workflow DB form
             bulk_db_id,
             feedback_db_id,
             process_name,
