@@ -18,19 +18,36 @@ Detailed architecture docs are in `.claude/rules/`:
 
 ## AWS Operations
 
-The AWS CLI is authenticated globally (IAM user `nzyme-santiago-IAM`, account `416418941636`). All commands below work from this project without additional setup.
+> **⚠️ Account migration (2026-06 — see `MIGRATION.md`).** Production now runs in **org account
+> `047719630984`** (Kibo Ventures), region `eu-west-1`, reached via the **`nzyme-new`** AWS CLI
+> profile — **append `--profile nzyme-new` to every command below.** That profile holds
+> short-lived SSO `Developer` credentials; when they expire, re-paste a fresh set from the AWS
+> access portal (`aws configure set ... --profile nzyme-new`).
+>
+> The **default** credentials (no profile) are still the **old** account `416418941636` (IAM user
+> `nzyme-santiago-IAM`), which now runs **only the webhook forwarder shim**
+> (`scripts/forwarder/forwarder.py`, see `MIGRATION.md`) and is pending decommission. A command
+> *without* `--profile` therefore targets the OLD account — be deliberate about which one you mean.
 
-### Resource Map
+### Resource Map (production = new account `047719630984`, profile `nzyme-new`)
 
 | Resource | Name / Identifier | Region |
 |----------|-------------------|--------|
+| CloudFormation stack | `nzyme-talent-engine` (SAM template `template.yaml`) | `eu-west-1` |
 | Lambda function | `nzyme-talent-management` (Python 3.11, 512 MB, 300 s, handler `main_lambda.lambda_handler`) | `eu-west-1` |
-| Lambda Function URL (webhooks) | `https://vi6n7zvmytou7djtx7ixmobc4e0ittqz.lambda-url.eu-west-1.on.aws/` | `eu-west-1` |
-| S3 deploy bucket | `nzyme-talent-engine-deploy` | `eu-west-1` |
+| Execution role | `arn:aws:iam::047719630984:role/passable/lambda-execution` (shared org role — the SSO Developer role cannot create IAM roles) | n/a |
+| Webhook ingress | **API Gateway HTTP API** `https://jlhp10k9w9.execute-api.eu-west-1.amazonaws.com` + `/<WEBHOOK_PATH_TOKEN>` — **public Lambda Function URLs are blocked org-wide (SCP/RCP → 403)**, so ingress is an HTTP API (payload v2.0 → same event shape, no app code change) | `eu-west-1` |
+| S3 artifact bucket (code uploads) | `aws-sam-cli-managed-default-samclisourcebucket-idxj7rxhtd6m` | `eu-west-1` |
+| S3 deploy bucket (in-stack, `DeployBucket`) | `nzyme-talent-engine-deploy-047719630984` | `eu-west-1` |
 | CloudWatch log group | `/aws/lambda/nzyme-talent-management` | `eu-west-1` |
 | EventBridge: Factory | `nzyme-factory-schedule` — `cron(0 * * * ? *)` | `eu-west-1` |
 | EventBridge: Harvester | `nzyme-harvester-schedule` — `cron(0/10 * * * ? *)` | `eu-west-1` |
 | EventBridge: Observer | `nzyme-observer-schedule` — `cron(3/10 * * * ? *)` | `eu-west-1` |
+
+Old account (`416418941636`, default creds, pending decommission): its Function URL
+`https://vi6n7zvmytou7djtx7ixmobc4e0ittqz.lambda-url.eu-west-1.on.aws/` still exists but the
+Lambda behind it now just **forwards** to the new HTTP API; its 3 EventBridge schedules are
+**DISABLED**.
 
 Harvester and Observer fire every 10 minutes (offset by 3 so they don't stampede). Factory runs hourly as a safety net only — new processes flow in via webhook, so the schedule just catches missed webhooks.
 
@@ -46,17 +63,27 @@ Key design points (see `import/IMPORT_PLAN.md` for the full rationale):
 
 ### Deploy
 
-Two supported paths — both build with manylinux2014_x86_64 / cp311 wheels (no Docker):
+**Canonical (new prod account `047719630984`):**
 
 ```powershell
-# IaC path (code + infrastructure) — preferred, post-import
-powershell -ExecutionPolicy Bypass -File scripts/deploy-sam.ps1
-
-# Legacy path (code only) — still works as a fallback
-powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1
+powershell -ExecutionPolicy Bypass -File scripts/deploy-greenfield.ps1
 ```
 
-`deploy-sam.ps1` builds `package/` exactly as before, then runs `sam deploy` against `template.yaml` (updating both code and infra) with secrets injected from `params/prod.json` and `ManageFunctionUrl=false` / `ManageEventPermissions=false` so the live URL is never touched. `deploy.ps1` caches pip dependencies (reinstalls only when `requirements.txt` SHA changes), builds `lambda.zip`, uploads to `s3://nzyme-talent-engine-deploy/lambda.zip`, then runs `aws lambda update-function-code`. Direct upload is avoided because the zip is ~46 MB (hits Lambda's direct-upload timeout).
+`deploy-greenfield.ps1` builds `package/` with manylinux2014_x86_64 / cp311 wheels (no Docker,
+**no SAM CLI** — SAM CLI isn't installed and isn't needed), then `aws cloudformation package` +
+`aws cloudformation deploy` against `template.yaml` (CloudFormation processes the `AWS::Serverless`
+transform server-side). It injects the secrets from `params/prod.json` and the greenfield
+overrides: `ManageFunctionUrl=false` (Function URLs are org-blocked — ingress is the HTTP API),
+`ManageEventPermissions=true`, the shared `passable/lambda-execution` role ARN, and the
+account-suffixed deploy-bucket name. **Do not delete/replace `WebhookHttpApi`** — a new HTTP API
+gets a new `{id}.execute-api` host and breaks every Notion automation; normal in-place deploys are
+safe. Verify after deploy with the `CodeSha256` check below.
+
+**Legacy / historical paths** (target the OLD account via *default* creds — used for the original
+adopted-prod import, now superseded by the migration; see `MIGRATION.md`): `scripts/deploy-sam.ps1`
+(needs SAM CLI; `ManageFunctionUrl=false`/`ManageEventPermissions=false`) and `scripts/deploy.ps1`
+(code-only `lambda.zip` → S3 → `update-function-code`). `scripts/deploy-forwarder.ps1` deploys the
+forwarder shim to the old account.
 
 **Verify a deploy actually changed code** — `update-function-code` prints `LastModified`, but the authoritative check is `CodeSha256`:
 ```bash

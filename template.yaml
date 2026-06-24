@@ -202,6 +202,23 @@ Resources:
           OPENAI_API_KEY: !Ref OpenAiApiKey
           EXA_API_KEY: !Ref ExaApiKey
           LOGFIRE_TOKEN: !Ref LogfireToken
+      # Public webhook ingress via API Gateway HTTP API (see WebhookHttpApi below for why
+      # this exists instead of the Function URL). Payload format 2.0 -> event shape matches
+      # a Function URL, so main_lambda's path-token gate + router are unchanged. ANY method
+      # so Notion's POST (and any verification GET) both route through.
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookHttpApi
+            Path: /{proxy+}
+            Method: ANY
+        WebhookRoot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookHttpApi
+            Path: /
+            Method: ANY
 
   # =====================================================================================
   # Execution role — only created for greenfield (ExecutionRoleArn left empty).
@@ -252,6 +269,22 @@ Resources:
       Action: lambda:InvokeFunctionUrl
       Principal: "*"
       FunctionUrlAuthType: NONE
+
+  # =====================================================================================
+  # API Gateway HTTP API — the ACTUAL public webhook ingress.
+  # Public Lambda Function URLs are blocked org-wide in the Kibo account (an SCP/RCP
+  # returns 403 at the auth layer even with AuthType=NONE + a public-invoke permission).
+  # The org's sanctioned pattern (used by nzyme-webhook) is an API Gateway HTTP API.
+  # Payload format 2.0 produces the SAME event shape as a Function URL (rawPath /
+  # requestContext.http / headers), so main_lambda's verify_path_token + WebhookRouter
+  # work unchanged. The "$default" stage means NO stage path segment, so the invoke URL is
+  #   https://{ApiId}.execute-api.{region}.amazonaws.com/<WEBHOOK_PATH_TOKEN>
+  # SAM auto-creates the apigateway->Lambda invoke permission for the HttpApi events above.
+  # =====================================================================================
+  WebhookHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: "$default"
 
   # =====================================================================================
   # EventBridge schedule rules — the safety-net triggers. EXACT cron expressions and the
@@ -350,6 +383,9 @@ Outputs:
     Description: Function URL (only when greenfield-managed; live prod URL is out-of-band).
     Condition: ShouldManageFunctionUrl
     Value: !GetAtt TalentEngineFunctionUrl.FunctionUrl
+  WebhookHttpApiUrl:
+    Description: Public webhook base URL (API Gateway HTTP API). Append '/' + WEBHOOK_PATH_TOKEN.
+    Value: !Sub "https://${WebhookHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
   DeployBucket:
     Description: S3 bucket used for deployment artifacts.
     Value: !Ref DeployBucket
